@@ -44,3 +44,23 @@ The AAS exchange uses Google's internal Android auth endpoint, not a documented
 OAuth flow, so Google can change it without notice. A Gemini API key
 (`GEMINI_API_KEY`) or the `google-vertex` provider with Application Default
 Credentials remain the supported routes.
+## Weekly sync
+
+`.github/workflows/build-patched.yml` also runs on `cron: '17 5 * * 1'` (every
+Monday, 05:17 UTC). That run first merges `earendil-works/pi` `main` into this
+branch, then builds and republishes the rolling release, so the release binary
+tracks upstream without manual work. Change the cron to move the day.
+
+The merge commit carries `[skip ci]` so the push it makes does not also fire the
+build matrix; the scheduled run does the build itself.
+
+If the merge conflicts, the job aborts with the commands to resolve it locally
+instead of leaving the branch mid-merge. After merging upstream, regenerate
+`google-aas.patch` if it no longer applies - the build fails loudly rather than
+publishing an unpatched binary.
+
+`workflow_dispatch` takes two toggles for on-demand runs:
+
+- `sync` (default true) - merge upstream first
+- `publish` (default true) - update the rolling release; false builds without
+  publishing, which is useful for testing an upstream bump
