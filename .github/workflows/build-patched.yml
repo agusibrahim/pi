@@ -25,6 +25,9 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
+    # contents: write is only needed to publish the rolling GitHub Release.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -146,3 +149,46 @@ jobs:
             build-out/pi-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish to GitHub Release
+        # Rolling release: one tag per platform that always holds the newest
+        # successful build, so `releases/download/<tag>/` stays a stable URL
+        # instead of producing a release per commit.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: patched-${{ matrix.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="build-out/pi-${{ matrix.platform }}.tar.gz"
+          sha="$(sha256sum "${archive}" | cut -d' ' -f1)"
+
+          notes="$(cat <<NOTES
+          Patched pi for ${{ matrix.platform }}, built from this fork with
+          \`patches/google-aas.patch\` applied.
+
+          - commit: \`${GITHUB_SHA}\`
+          - workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - sha256: \`${sha}\`
+
+          The build fails if the compiled binary does not contain the Android AAS
+          token exchange, so an asset here always carries the patch.
+
+          macOS Gatekeeper quarantines downloaded binaries:
+          \`xattr -dr com.apple.quarantine pi\` after extracting, then \`chmod +x pi\`.
+          NOTES
+          )"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "updating existing release ${RELEASE_TAG}"
+            gh release edit "${RELEASE_TAG}" --title "${RELEASE_TAG}" --notes "${notes}" --prerelease
+          else
+            echo "creating release ${RELEASE_TAG}"
+            gh release create "${RELEASE_TAG}" --title "${RELEASE_TAG}" --notes "${notes}" --prerelease
+          fi
+
+          gh release upload "${RELEASE_TAG}" "${archive}" --clobber
+          printf '%s  %s\n' "${sha}" "$(basename "${archive}")" > "build-out/SHA256SUMS-${RELEASE_TAG}.txt"
+          gh release upload "${RELEASE_TAG}" "build-out/SHA256SUMS-${RELEASE_TAG}.txt" --clobber
