@@ -1,0 +1,847 @@
+diff --git a/packages/ai/CHANGELOG.md b/packages/ai/CHANGELOG.md
+index b06b70252..a2bcc7aee 100644
+--- a/packages/ai/CHANGELOG.md
++++ b/packages/ai/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Added Android AAS sign-in for the `google` provider. The Gemini Developer API accepts OAuth access tokens only as `Authorization: Bearer`, so `/login google` can now exchange a pasted Android AAS master token (`aas_et/...`) for an access token and renew it automatically, instead of requiring a Gemini API key
++
+ ### Fixed
+ 
+ - Fixed whitespace-only tool output (for example a bare `\r\n` from bash) being sent as-is to OpenAI Completions, OpenAI Responses, and Google providers; it now uses the same placeholder as empty output, since some providers reject whitespace-only tool content with a 400 ([#8720](https://github.com/earendil-works/pi/issues/8720))
+diff --git a/packages/ai/src/api/google-generative-ai.ts b/packages/ai/src/api/google-generative-ai.ts
+index 24fe9134c..c7ecdaf78 100644
+--- a/packages/ai/src/api/google-generative-ai.ts
++++ b/packages/ai/src/api/google-generative-ai.ts
+@@ -9,7 +9,6 @@ import type {
+ 	Api,
+ 	AssistantMessage,
+ 	Model,
+-	ProviderHeaders,
+ 	SimpleStreamOptions,
+ 	StreamFunction,
+ 	StreamOptions,
+@@ -87,11 +86,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
+ 			if (options?.fetch && options.fetch !== globalThis.fetch) {
+ 				throw new Error("Custom fetch is not supported by the Google Generative AI adapter");
+ 			}
+-			const apiKey = options?.apiKey;
+-			if (!apiKey) {
+-				throw new Error(`No API key for provider: ${model.provider}`);
+-			}
+-			const client = createClient(model, apiKey, options?.headers);
++			const client = createClient(model, resolveRequestAuth(model, options));
+ 			let params = buildParams(model, normalizedContext, options);
+ 			const nextParams = await options?.onPayload?.(params, model);
+ 			if (nextParams !== undefined) {
+@@ -307,13 +302,11 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
+ 	context: TranscriptContext,
+ 	options?: SimpleStreamOptions,
+ ): AssistantMessageEventStream => {
+-	const apiKey = options?.apiKey;
+-	if (!apiKey) {
+-		throw new Error(`No API key for provider: ${model.provider}`);
+-	}
++	const auth = resolveRequestAuth(model, options);
+ 
+ 	const base = {
+-		...buildBaseOptions(model, context, options, apiKey),
++		// The bearer path authenticates through a header, never an apiKey.
++		...buildBaseOptions(model, context, options, auth.kind === "api_key" ? auth.apiKey : undefined),
+ 		toolChoice: options?.toolChoice,
+ 	} satisfies GoogleOptions;
+ 	if (!options?.reasoning) {
+@@ -345,19 +338,66 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
+ 	} satisfies GoogleOptions);
+ };
+ 
+-function createClient(
++type GoogleRequestAuth =
++	| { kind: "api_key"; apiKey: string; headers?: Record<string, string> }
++	| { kind: "bearer"; headers: Record<string, string> };
++
++/** Case-insensitive header lookup over a record produced by providerHeadersToRecord. */
++function hasHeader(headers: Record<string, string>, name: string): boolean {
++	return Object.keys(headers).some((key) => key.toLowerCase() === name);
++}
++
++/**
++ * Resolve how this request authenticates against the Gemini Developer API.
++ *
++ * `@google/genai` turns any `apiKey` into an `x-goog-api-key` header, and the
++ * API only accepts Gemini API keys there — an OAuth access token sent that way
++ * fails with `API_KEY_INVALID` even when the same token works as
++ * `Authorization: Bearer`. So a caller-supplied Authorization header selects the
++ * bearer path, which never hands the token to the SDK as an API key.
++ */
++function resolveRequestAuth(
+ 	model: Model<"google-generative-ai">,
+-	apiKey?: string,
+-	optionsHeaders?: ProviderHeaders,
+-): GoogleGenAI {
++	options?: Pick<GoogleOptions, "apiKey" | "headers">,
++): GoogleRequestAuth {
++	const headers = providerHeadersToRecord({ "User-Agent": getPiUserAgent(), ...model.headers, ...options?.headers });
++	if (headers && hasHeader(headers, "authorization")) return { kind: "bearer", headers };
++	if (!options?.apiKey) {
++		throw new Error(`No API key or OAuth token for provider: ${model.provider}`);
++	}
++	return { kind: "api_key", apiKey: options.apiKey, headers };
++}
++
++/**
++ * Placeholder handed to the SDK on the bearer path. `@google/genai` treats an
++ * undefined `apiKey` as "use Application Default Credentials" and then fails
++ * with "Could not load the default credentials" when no ADC file exists, so the
++ * SDK is kept on its cheap api-key branch instead.
++ *
++ * The value is never transmitted: pre-setting `x-goog-api-key` makes the SDK's
++ * `addKeyHeader` return early, and a truthy value keeps the SDK's
++ * "API key should be set" warning out of the transcript. Real bearer tokens in
++ * that header are rejected by the API with `API_KEY_INVALID`.
++ */
++const BEARER_API_KEY_PLACEHOLDER = "bearer";
++
++function createClient(model: Model<"google-generative-ai">, auth: GoogleRequestAuth): GoogleGenAI {
+ 	const httpOptions: { baseUrl?: string; apiVersion?: string; headers?: Record<string, string> } = {};
+ 	if (model.baseUrl) {
+ 		httpOptions.baseUrl = model.baseUrl;
+ 		httpOptions.apiVersion = ""; // baseUrl already includes version path, don't append
+ 	}
+-	const headers = providerHeadersToRecord({ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders });
+-	if (headers) {
+-		httpOptions.headers = headers;
++
++	let apiKey: string | undefined;
++	if (auth.kind === "bearer") {
++		apiKey = BEARER_API_KEY_PLACEHOLDER;
++		httpOptions.headers = { ...auth.headers };
++		if (!hasHeader(httpOptions.headers, "x-goog-api-key")) {
++			httpOptions.headers["x-goog-api-key"] = "";
++		}
++	} else {
++		apiKey = auth.apiKey;
++		if (auth.headers) httpOptions.headers = auth.headers;
+ 	}
+ 
+ 	return new GoogleGenAI({
+diff --git a/packages/ai/src/auth/oauth/load.ts b/packages/ai/src/auth/oauth/load.ts
+index 839fe3152..5121da78b 100644
+--- a/packages/ai/src/auth/oauth/load.ts
++++ b/packages/ai/src/auth/oauth/load.ts
+@@ -18,6 +18,7 @@ type OAuthFlowLoaders = {
+ 	githubCopilot: () => OAuthAuth | Promise<OAuthAuth>;
+ 	openrouter: () => OAuthAuth | Promise<OAuthAuth>;
+ 	kimiCoding: () => OAuthAuth | Promise<OAuthAuth>;
++	google: () => OAuthAuth | Promise<OAuthAuth>;
+ 	meta: () => OAuthAuth | Promise<OAuthAuth>;
+ 	xai: () => OAuthAuth | Promise<OAuthAuth>;
+ 	radius: (options: { name: string; gateway: string }) => OAuthAuth | Promise<OAuthAuth>;
+@@ -60,6 +61,11 @@ export const loadKimiCodingOAuth = async (): Promise<OAuthAuth> => {
+ 	return ((await importOAuthModule("./kimi-coding.ts")) as { kimiCodingOAuth: OAuthAuth }).kimiCodingOAuth;
+ };
+ 
++export const loadGoogleOAuth = async (): Promise<OAuthAuth> => {
++	if (bundledLoaders) return bundledLoaders.google();
++	return ((await importOAuthModule("./google.ts")) as { googleOAuth: OAuthAuth }).googleOAuth;
++};
++
+ export const loadMetaOAuth = async (): Promise<OAuthAuth> => {
+ 	if (bundledLoaders) return bundledLoaders.meta();
+ 	return ((await importOAuthModule("./meta.ts")) as { metaOAuth: OAuthAuth }).metaOAuth;
+diff --git a/packages/ai/src/bun-oauth.ts b/packages/ai/src/bun-oauth.ts
+index 5e77cf1b6..69ce3901c 100644
+--- a/packages/ai/src/bun-oauth.ts
++++ b/packages/ai/src/bun-oauth.ts
+@@ -1,5 +1,6 @@
+ import { anthropicOAuth } from "./auth/oauth/anthropic.ts";
+ import { githubCopilotOAuth } from "./auth/oauth/github-copilot.ts";
++import { googleOAuth } from "./auth/oauth/google.ts";
+ import { kimiCodingOAuth } from "./auth/oauth/kimi-coding.ts";
+ import { registerBundledOAuthFlowLoaders } from "./auth/oauth/load.ts";
+ import { metaOAuth } from "./auth/oauth/meta.ts";
+@@ -18,6 +19,7 @@ export function registerBunOAuthFlows(): void {
+ 		githubCopilot: () => githubCopilotOAuth,
+ 		openrouter: () => openRouterOAuth,
+ 		kimiCoding: () => kimiCodingOAuth,
++		google: () => googleOAuth,
+ 		meta: () => metaOAuth,
+ 		xai: () => xaiOAuth,
+ 		radius: createRadiusOAuth,
+diff --git a/packages/ai/src/providers/google.ts b/packages/ai/src/providers/google.ts
+index 0bd452373..c9e17240c 100644
+--- a/packages/ai/src/providers/google.ts
++++ b/packages/ai/src/providers/google.ts
+@@ -1,5 +1,6 @@
+ import { googleGenerativeAIApi } from "../api/google-generative-ai.lazy.ts";
+-import { envApiKeyAuth } from "../auth/helpers.ts";
++import { envApiKeyAuth, lazyOAuth } from "../auth/helpers.ts";
++import { loadGoogleOAuth } from "../auth/oauth/load.ts";
+ import { createProvider, type Provider } from "../models.ts";
+ import { GOOGLE_MODELS } from "./google.models.ts";
+ 
+@@ -8,7 +9,14 @@ export function googleProvider(): Provider<"google-generative-ai"> {
+ 		id: "google",
+ 		name: "Google",
+ 		baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+-		auth: { apiKey: envApiKeyAuth("Gemini API key", ["GEMINI_API_KEY"]) },
++		auth: {
++			apiKey: envApiKeyAuth("Gemini API key", ["GEMINI_API_KEY"]),
++			oauth: lazyOAuth({
++				name: "Google Gemini (Android AAS)",
++				loginLabel: "Sign in with a Google Android AAS token",
++				load: loadGoogleOAuth,
++			}),
++		},
+ 		models: Object.values(GOOGLE_MODELS),
+ 		api: googleGenerativeAIApi(),
+ 	});
+diff --git a/scripts/build-coding-agent-bundle.mjs b/scripts/build-coding-agent-bundle.mjs
+index d2f622d6b..013515fea 100644
+--- a/scripts/build-coding-agent-bundle.mjs
++++ b/scripts/build-coding-agent-bundle.mjs
+@@ -182,6 +182,7 @@ const lazyEntryPoints = {
+ 	anthropic: join(aiDistDir, "auth", "oauth", "anthropic.js"),
+ 	"bedrock-converse-stream": join(aiDistDir, "api", "bedrock-converse-stream.js"),
+ 	"github-copilot": join(aiDistDir, "auth", "oauth", "github-copilot.js"),
++	google: join(aiDistDir, "auth", "oauth", "google.js"),
+ 	"image-resize-worker": join(codingAgentDistDir, "utils", "image-resize-worker.js"),
+ 	"kimi-coding": join(aiDistDir, "auth", "oauth", "kimi-coding.js"),
+ 	meta: join(aiDistDir, "auth", "oauth", "meta.js"),
+diff --git a/packages/ai/src/auth/oauth/google.ts b/packages/ai/src/auth/oauth/google.ts
+new file mode 100644
+index 000000000..2fc292df3
+--- /dev/null
++++ b/packages/ai/src/auth/oauth/google.ts
+@@ -0,0 +1,228 @@
++/**
++ * Google Gemini (Generative Language API) Android AAS auth flow
++ *
++ * The Gemini Developer API accepts OAuth access tokens only as
++ * `Authorization: Bearer <token>`. `@google/genai` turns any `GoogleGenAI`
++ * `apiKey` into an `x-goog-api-key` header instead, and the API rejects OAuth
++ * tokens there with `API_KEY_INVALID`. So `toAuth` returns the token as a
++ * request header rather than as an `apiKey`.
++ *
++ * Credential source: the Android auth service (AAS). The user pastes a master
++ * AAS token (`aas_et/...`, optionally the full
++ * `androidId=...&Email=...&Token=...` auth string it belongs to) and the flow
++ * exchanges it for a short-lived `ya29...` access token. Because the master token
++ * outlives the access token, `refresh` re-runs the same exchange, so one paste
++ * keeps working across the ~1 hour access-token lifetime.
++ */
++
++import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
++
++const AAS_TOKEN_URL = "https://android.googleapis.com/auth";
++const AAS_USER_AGENT = "GoogleAuth/1.4";
++/** Google Play services identity the AAS exchange is performed as. */
++const AAS_APP = "com.google.android.googlequicksearchbox";
++const AAS_CLIENT_SIG = "38918a453d07199354f8b19af05ec6562ced5788";
++const AAS_DEVICE_COUNTRY = "id";
++const AAS_GOOGLE_PLAY_SERVICES_VERSION = "263332035";
++const AAS_SDK_VERSION = "35";
++/**
++ * Scopes requested from the exchange. The Gemini API needs
++ * `generative-language`; the remaining scopes let the same master token serve
++ * the other Google APIs reachable from an Android account. AAS takes the
++ * `oauth2:` scheme marker once, on the first scope only.
++ */
++const AAS_SCOPES = [
++	"https://www.googleapis.com/auth/assistant",
++	"https://www.googleapis.com/auth/generative-language",
++	"https://www.googleapis.com/auth/photos.image.readonly",
++	"https://www.googleapis.com/auth/drive",
++];
++const AAS_SERVICE = `oauth2:${AAS_SCOPES.join(" ")}`;
++/** AAS reports a 1 hour lifetime; assume a shorter one when it does not say. */
++const ASSUMED_ACCESS_TOKEN_LIFETIME_MS = 55 * 60 * 1000;
++
++interface AasMaster {
++	androidId?: string;
++	Email?: string;
++	token: string;
++}
++
++function readString(value: string | undefined): string | undefined {
++	const trimmed = value
++		?.trim()
++		.replace(/^'+|'+$/g, "")
++		.trim();
++	return trimmed ? trimmed : undefined;
++}
++
++/**
++ * Accept either a bare master token or the `androidId`/`Email`/`Token` query
++ * string Google and Android tooling store alongside it.
++ */
++function parseAasMaster(input: string): AasMaster {
++	const trimmed = input
++		.trim()
++		.replace(/^"+|"+$/g, "")
++		.trim();
++	const unescaped = (() => {
++		try {
++			return decodeURIComponent(trimmed);
++		} catch {
++			return trimmed;
++		}
++	})();
++
++	if (unescaped.startsWith("aas_et/")) return { token: unescaped };
++
++	const query = new URLSearchParams(unescaped);
++	const token = readString(query.get("Token") ?? undefined) ?? readString(query.get("token") ?? undefined);
++	if (token) {
++		return {
++			token,
++			androidId: readString(query.get("androidId") ?? undefined),
++			Email: readString(query.get("Email") ?? undefined),
++		};
++	}
++
++	const marker = trimmed.indexOf("aas_et");
++	if (marker >= 0) return { token: unescaped.slice(marker) };
++
++	throw new Error("No AAS master token found. Paste aas_et/... or androidId=...&Email=...&Token=...");
++}
++
++/**
++ * AAS answers with a `key=value` block separated by spaces, commas and
++ * semicolons, with quoted values and space-containing lists such as
++ * `grantedScopes`. Unkeyed tokens continue the previous value.
++ */
++function parseAasResponse(body: string): Map<string, string> {
++	const fields = new Map<string, string>();
++	let lastKey: string | undefined;
++	for (const chunk of body.split(/[\s,;]+/)) {
++		const token = chunk.replace(/^'+|'+$/g, "");
++		if (!token) continue;
++		const separator = token.indexOf("=");
++		if (separator > 0) {
++			const key = token.slice(0, separator);
++			const value = token.slice(separator + 1);
++			fields.set(key, fields.has(key) ? `${fields.get(key)},${value}` : value);
++			lastKey = key;
++		} else if (lastKey) {
++			fields.set(lastKey, `${fields.get(lastKey)} ${token}`);
++		}
++	}
++	return fields;
++}
++
++function readExpires(fields: Map<string, string>): number {
++	const expiry = Number(fields.get("Expiry"));
++	if (Number.isFinite(expiry) && expiry > 0) return expiry * 1000;
++	const duration = Number(fields.get("ExpiresInDurationSec"));
++	if (Number.isFinite(duration) && duration > 0) return Date.now() + duration * 1000;
++	return Date.now() + ASSUMED_ACCESS_TOKEN_LIFETIME_MS;
++}
++
++async function exchangeAasMaster(master: AasMaster, signal: AbortSignal): Promise<OAuthCredential> {
++	const body = new URLSearchParams({
++		Token: master.token,
++		Email: master.Email ?? "",
++		service: AAS_SERVICE,
++		app: AAS_APP,
++		callerPkg: AAS_APP,
++		client_sig: AAS_CLIENT_SIG,
++		callerSig: AAS_CLIENT_SIG,
++		source: "android",
++		device_country: AAS_DEVICE_COUNTRY,
++		lang: "en_US",
++		sdk_version: AAS_SDK_VERSION,
++		google_play_services_version: AAS_GOOGLE_PLAY_SERVICES_VERSION,
++		...(master.androidId ? { androidId: master.androidId } : {}),
++	});
++
++	let response: Response;
++	try {
++		response = await fetch(AAS_TOKEN_URL, {
++			method: "POST",
++			headers: {
++				"Content-Type": "application/x-www-form-urlencoded",
++				"User-Agent": AAS_USER_AGENT,
++			},
++			body,
++			signal,
++		});
++	} catch (error) {
++		throw new Error(
++			`Google AAS token exchange request failed: ${error instanceof Error ? error.message : String(error)}`,
++		);
++	}
++
++	const text = await response.text().catch(() => "");
++	if (!response.ok) {
++		throw new Error(`Google AAS token exchange failed (${response.status}): ${text.slice(0, 400)}`);
++	}
++
++	const fields = parseAasResponse(text);
++	const failure = readString(fields.get("Error"));
++	if (failure) throw new Error(`Google AAS token exchange rejected the master token: ${failure}`);
++
++	const access = readString(fields.get("Auth"));
++	if (!access) {
++		throw new Error(`Google AAS token exchange returned no Auth value: ${text.slice(0, 400)}`);
++	}
++
++	return {
++		type: "oauth",
++		access,
++		// The AAS master token is what renews the access token, so it occupies the
++		// canonical `refresh` slot.
++		refresh: master.token,
++		expires: readExpires(fields),
++		aas_android_id: master.androidId ?? "",
++		aas_email: master.Email ?? "",
++	};
++}
++
++function masterFromCredential(credential: OAuthCredential): AasMaster {
++	const token = readString(credential.refresh);
++	if (!token) {
++		throw new Error("Google AAS credential cannot renew itself. Log in again to enter a new AAS token.");
++	}
++	return {
++		token,
++		androidId: readString(typeof credential.aas_android_id === "string" ? credential.aas_android_id : undefined),
++		Email: readString(typeof credential.aas_email === "string" ? credential.aas_email : undefined),
++	};
++}
++
++export const googleOAuth: OAuthAuth = {
++	name: "Google Gemini (Android AAS)",
++	loginLabel: "Sign in with a Google Android AAS token",
++
++	async login(interaction: ProviderAuthInteraction) {
++		const input = await interaction.prompt({
++			type: "secret",
++			message: "Paste Google AAS token (aas_et/... or androidId=...&Email=...&Token=...)",
++			placeholder: "aas_et/...",
++		});
++		const master = parseAasMaster(input);
++		let email = master.Email;
++		if (!email) {
++			// AAS cross-checks the account, so a bare master token is not enough.
++			email = readString(
++				await interaction.prompt({ type: "text", message: "Google account email for the AAS token" }),
++			);
++			if (!email) throw new Error("Missing Google account email for the AAS token");
++		}
++		return exchangeAasMaster({ ...master, Email: email }, interaction.signal);
++	},
++
++	async refresh(credential, signal) {
++		return exchangeAasMaster(masterFromCredential(credential), signal);
++	},
++
++	// No apiKey: the SDK would turn one into `x-goog-api-key`, which the Gemini
++	// API rejects for OAuth tokens.
++	async toAuth(credential) {
++		return { headers: { Authorization: `Bearer ${credential.access}` } };
++	},
++};
+diff --git a/packages/ai/test/google-oauth.test.ts b/packages/ai/test/google-oauth.test.ts
+new file mode 100644
+index 000000000..06ed2a7c0
+--- /dev/null
++++ b/packages/ai/test/google-oauth.test.ts
+@@ -0,0 +1,245 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { googleOAuth } from "../src/auth/oauth/google.ts";
++import type { AuthPrompt, ProviderAuthInteraction } from "../src/auth/types.ts";
++import { googleProvider } from "../src/providers/google.ts";
++
++const AAS_TOKEN_URL = "https://android.googleapis.com/auth";
++const MASTER_TOKEN = "aas_et/AKppINtestmastertokenvalue";
++const ACCESS_TOKEN = "ya29.test-access-token";
++
++function aasResponse(fields: Record<string, string>): Response {
++	return new Response(
++		`SID=${crypto.randomUUID()}\n${Object.entries(fields)
++			.map(([key, value]) => `${key}=${value}`)
++			.join("\n")}\n`,
++		{ status: 200 },
++	);
++}
++
++function getUrl(input: unknown): string {
++	if (input instanceof URL) return input.toString();
++	if (input instanceof Request) return input.url;
++	if (typeof input === "string") return input;
++	throw new Error(`Unsupported fetch input: ${String(input)}`);
++}
++
++function createInteraction(answers: Record<string, string>): ProviderAuthInteraction {
++	return {
++		signal: new AbortController().signal,
++		prompt: async (prompt: AuthPrompt) => {
++			const answer = answers[prompt.message];
++			if (answer !== undefined) return answer;
++			if (prompt.type === "select") return prompt.options[0]!.id;
++			throw new Error(`Unexpected prompt: ${prompt.message}`);
++		},
++		notify: () => {},
++	};
++}
++
++const AAS_PROMPT = "Paste Google AAS token (aas_et/... or androidId=...&Email=...&Token=...)";
++
++describe("Google Android AAS OAuth", () => {
++	beforeEach(() => {
++		vi.useFakeTimers();
++		vi.setSystemTime(new Date("2026-10-18T00:00:00Z"));
++	});
++
++	afterEach(() => {
++		vi.restoreAllMocks();
++		vi.unstubAllGlobals();
++		vi.useRealTimers();
++	});
++
++	it("registers OAuth alongside the api key on the google provider", () => {
++		const provider = googleProvider();
++		expect(provider.auth.oauth).toBeDefined();
++		expect(provider.auth.apiKey).toBeDefined();
++	});
++
++	it("derives a bearer header instead of an api key", async () => {
++		await expect(
++			googleOAuth.toAuth({ type: "oauth", access: ACCESS_TOKEN, refresh: MASTER_TOKEN, expires: 1 }),
++		).resolves.toEqual({ headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } });
++	});
++
++	it("exchanges a bare AAS master token for an access token", async () => {
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(async (input: unknown, init?: RequestInit) => {
++				expect(getUrl(input)).toBe(AAS_TOKEN_URL);
++				expect(init?.method).toBe("POST");
++				expect(init?.headers).toMatchObject({ "User-Agent": "GoogleAuth/1.4" });
++				const body = new URLSearchParams(String(init?.body));
++				expect(body.get("Token")).toBe(MASTER_TOKEN);
++				expect(body.get("Email")).toBe("cafe@agusibrah.im");
++				expect(body.get("app")).toBe("com.google.android.googlequicksearchbox");
++				expect(body.get("callerSig")).toBe("38918a453d07199354f8b19af05ec6562ced5788");
++				expect(body.get("service")).toBe(
++					"oauth2:https://www.googleapis.com/auth/assistant https://www.googleapis.com/auth/generative-language https://www.googleapis.com/auth/photos.image.readonly https://www.googleapis.com/auth/drive",
++				);
++				expect(body.get("source")).toBe("android");
++				return aasResponse({ Auth: ACCESS_TOKEN, ExpiresInDurationSec: "3600" });
++			}),
++		);
++
++		await expect(
++			googleOAuth.login(
++				createInteraction({
++					[AAS_PROMPT]: MASTER_TOKEN,
++					"Google account email for the AAS token": "cafe@agusibrah.im",
++				}),
++			),
++		).resolves.toEqual({
++			type: "oauth",
++			access: ACCESS_TOKEN,
++			refresh: MASTER_TOKEN,
++			expires: Date.now() + 3600 * 1000,
++			aas_android_id: "",
++			aas_email: "cafe@agusibrah.im",
++		});
++	});
++
++	it("accepts the full AAS auth string and skips the email prompt", async () => {
++		const androidId = "3c4096cfd46caf54";
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(async (_input: unknown, init?: RequestInit) => {
++				const body = new URLSearchParams(String(init?.body));
++				expect(body.get("Token")).toBe(MASTER_TOKEN);
++				expect(body.get("Email")).toBe("cafe@agusibrah.im");
++				expect(body.get("androidId")).toBe(androidId);
++				return aasResponse({ Auth: ACCESS_TOKEN, Expiry: `${(Date.now() + 3600 * 1000) / 1000}` });
++			}),
++		);
++
++		const credential = await googleOAuth.login(
++			createInteraction({
++				[AAS_PROMPT]: `androidId=${androidId}&Email=cafe%40agusibrah.im&Token=${MASTER_TOKEN}`,
++			}),
++		);
++
++		expect(credential).toMatchObject({
++			access: ACCESS_TOKEN,
++			refresh: MASTER_TOKEN,
++			expires: Date.now() + 3600 * 1000,
++			aas_android_id: androidId,
++			aas_email: "cafe@agusibrah.im",
++		});
++	});
++
++	it("prefers the absolute Expiry over the relative duration", async () => {
++		const expirySeconds = Math.floor(Date.now() / 1000) + 1234;
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(async () =>
++				aasResponse({ Auth: ACCESS_TOKEN, ExpiresInDurationSec: "9999", Expiry: `${expirySeconds}` }),
++			),
++		);
++
++		const credential = await googleOAuth.login(
++			createInteraction({
++				[AAS_PROMPT]: MASTER_TOKEN,
++				"Google account email for the AAS token": "cafe@agusibrah.im",
++			}),
++		);
++
++		expect(credential.expires).toBe(expirySeconds * 1000);
++	});
++
++	it("re-exchanges the stored master token when the access token expires", async () => {
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(async (_input: unknown, init?: RequestInit) => {
++				const body = new URLSearchParams(String(init?.body));
++				expect(body.get("Token")).toBe(MASTER_TOKEN);
++				expect(body.get("Email")).toBe("cafe@agusibrah.im");
++				expect(body.get("androidId")).toBe("3c4096cfd46caf54");
++				return aasResponse({ Auth: "ya29.renewed", ExpiresInDurationSec: "3600" });
++			}),
++		);
++
++		await expect(
++			googleOAuth.refresh(
++				{
++					type: "oauth",
++					access: ACCESS_TOKEN,
++					refresh: MASTER_TOKEN,
++					expires: 1,
++					aas_android_id: "3c4096cfd46caf54",
++					aas_email: "cafe@agusibrah.im",
++				},
++				new AbortController().signal,
++			),
++		).resolves.toEqual({
++			type: "oauth",
++			access: "ya29.renewed",
++			refresh: MASTER_TOKEN,
++			expires: Date.now() + 3600 * 1000,
++			aas_android_id: "3c4096cfd46caf54",
++			aas_email: "cafe@agusibrah.im",
++		});
++	});
++
++	it("surfaces the AAS error field instead of a generic failure", async () => {
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(async () => new Response("Error=BadAuthentication\nurl='https://android.clients.google.com/auth'")),
++		);
++
++		await expect(
++			googleOAuth.login(
++				createInteraction({
++					[AAS_PROMPT]: MASTER_TOKEN,
++					"Google account email for the AAS token": "cafe@agusibrah.im",
++				}),
++			),
++		).rejects.toThrow("Google AAS token exchange rejected the master token: BadAuthentication");
++	});
++
++	it("surfaces AAS HTTP failures", async () => {
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(async () => new Response("upstream boom", { status: 503 })),
++		);
++
++		await expect(
++			googleOAuth.login(
++				createInteraction({
++					[AAS_PROMPT]: MASTER_TOKEN,
++					"Google account email for the AAS token": "cafe@agusibrah.im",
++				}),
++			),
++		).rejects.toThrow("Google AAS token exchange failed (503): upstream boom");
++	});
++
++	it("refuses input without a master token", async () => {
++		await expect(googleOAuth.login(createInteraction({ [AAS_PROMPT]: "not-a-token" }))).rejects.toThrow(
++			"No AAS master token found",
++		);
++	});
++
++	it("refuses to renew a credential with no master token", async () => {
++		await expect(
++			googleOAuth.refresh(
++				{ type: "oauth", access: ACCESS_TOKEN, refresh: "", expires: 1 },
++				new AbortController().signal,
++			),
++		).rejects.toThrow("Google AAS credential cannot renew itself. Log in again to enter a new AAS token.");
++	});
++
++	it("assumes a short lifetime when AAS reports no expiry", async () => {
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(async () => aasResponse({ Auth: ACCESS_TOKEN })),
++		);
++
++		const credential = await googleOAuth.login(
++			createInteraction({
++				[AAS_PROMPT]: MASTER_TOKEN,
++				"Google account email for the AAS token": "cafe@agusibrah.im",
++			}),
++		);
++
++		expect(credential.expires).toBe(Date.now() + 55 * 60 * 1000);
++	});
++});
+diff --git a/packages/ai/test/google-oauth-bearer.test.ts b/packages/ai/test/google-oauth-bearer.test.ts
+new file mode 100644
+index 000000000..8dbf0bd60
+--- /dev/null
++++ b/packages/ai/test/google-oauth-bearer.test.ts
+@@ -0,0 +1,142 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const googleGenAiMock = vi.hoisted(() => ({
++	constructorCalls: [] as Array<Record<string, unknown>>,
++}));
++
++vi.mock("@google/genai", () => {
++	class GoogleGenAI {
++		models = {
++			generateContentStream: async function* () {
++				yield {
++					responseId: "gemini-response-id",
++					candidates: [
++						{
++							content: { parts: [{ text: "ok" }] },
++							finishReason: "STOP",
++						},
++					],
++					usageMetadata: {
++						promptTokenCount: 1,
++						candidatesTokenCount: 1,
++						totalTokenCount: 2,
++					},
++				};
++			},
++		};
++
++		constructor(config: Record<string, unknown>) {
++			googleGenAiMock.constructorCalls.push(config);
++		}
++	}
++
++	return {
++		GoogleGenAI,
++		ThinkingLevel: {
++			THINKING_LEVEL_UNSPECIFIED: "THINKING_LEVEL_UNSPECIFIED",
++			MINIMAL: "MINIMAL",
++			LOW: "LOW",
++			MEDIUM: "MEDIUM",
++			HIGH: "HIGH",
++		},
++	};
++});
++
++import { stream as streamGoogle } from "../src/api/google-generative-ai.ts";
++import { getModel, normalizeContext } from "../src/compat.ts";
++
++const model = getModel("google", "gemini-3-flash-preview");
++const context = normalizeContext({
++	messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
++});
++
++function lastClient(): Record<string, unknown> {
++	const calls = googleGenAiMock.constructorCalls;
++	if (calls.length !== 1) throw new Error(`Expected exactly one GoogleGenAI call, got ${calls.length}`);
++	return calls[0] as Record<string, unknown>;
++}
++
++function clientHeaders(): Record<string, string> {
++	return (lastClient().httpOptions as { headers: Record<string, string> }).headers;
++}
++
++/**
++ * The Gemini Developer API accepts OAuth access tokens only as
++ * `Authorization: Bearer`. `@google/genai` derives `x-goog-api-key` from any
++ * `apiKey` and the API answers `API_KEY_INVALID` for an OAuth token there, so
++ * the bearer path must suppress the apiKey entirely.
++ */
++describe("google bearer auth", () => {
++	beforeEach(() => {
++		googleGenAiMock.constructorCalls.length = 0;
++	});
++
++	afterEach(() => {
++		vi.restoreAllMocks();
++		vi.unstubAllGlobals();
++	});
++
++	it("sends an OAuth token as a bearer header and no api key", async () => {
++		const stream = streamGoogle(model, context, {
++			headers: { Authorization: "Bearer ya29.test-access-token" },
++		});
++
++		await stream.result();
++
++		expect(clientHeaders()).toMatchObject({ Authorization: "Bearer ya29.test-access-token" });
++		// The SDK treats an undefined apiKey as "use Application Default
++		// Credentials" and then fails with "Could not load the default
++		// credentials", so it gets a placeholder instead. Pre-setting
++		// x-goog-api-key keeps the SDK from sending that placeholder.
++		expect(lastClient().apiKey).toBeTruthy();
++		expect(clientHeaders()["x-goog-api-key"]).toBe("");
++	});
++
++	it("prefers the bearer header over an api key that would become x-goog-api-key", async () => {
++		const stream = streamGoogle(model, context, {
++			apiKey: "AIzaSyExampleRealisticLookingApiKey123456",
++			headers: { authorization: "Bearer ya29.test-access-token" },
++		});
++
++		await stream.result();
++
++		expect(lastClient().apiKey).not.toBe("AIzaSyExampleRealisticLookingApiKey123456");
++		expect(clientHeaders().authorization).toBe("Bearer ya29.test-access-token");
++	});
++
++	it("does not overwrite a caller-supplied x-goog-api-key", async () => {
++		const stream = streamGoogle(model, context, {
++			headers: {
++				Authorization: "Bearer ya29.test-access-token",
++				"X-Goog-Api-Key": "caller-value",
++			},
++		});
++
++		await stream.result();
++
++		const apiKeyHeader = Object.entries(clientHeaders()).find(([name]) => name.toLowerCase() === "x-goog-api-key");
++		expect(apiKeyHeader?.[1]).toBe("caller-value");
++	});
++
++	it("still passes through api keys unchanged", async () => {
++		const stream = streamGoogle(model, context, {
++			apiKey: "AIzaSyExampleRealisticLookingApiKey123456",
++		});
++
++		await stream.result();
++
++		expect(lastClient().apiKey).toBe("AIzaSyExampleRealisticLookingApiKey123456");
++		expect(clientHeaders()).not.toHaveProperty("Authorization");
++		expect(clientHeaders()).not.toHaveProperty("authorization");
++	});
++
++	it("fails with a clear message when no credential is available", async () => {
++		const stream = streamGoogle(model, context, {});
++
++		const result = await stream.result();
++
++		expect(result.stopReason).toBe("error");
++		expect(result.errorMessage).toContain("No API key or OAuth token for provider: google");
++		expect(googleGenAiMock.constructorCalls).toHaveLength(0);
++	});
++});
