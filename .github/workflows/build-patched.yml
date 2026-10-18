@@ -12,7 +12,20 @@ on:
       - '.github/workflows/build-patched.yml'
       - 'packages/ai/**'
       - 'scripts/build-coding-agent-bundle.mjs'
+  # Weekly upstream sync, then rebuild so the rolling release binary never goes
+  # stale. Every Monday 05:17 UTC; change the cron to move the day.
+  schedule:
+    - cron: '17 5 * * 1'
   workflow_dispatch:
+    inputs:
+      sync:
+        description: 'Merge upstream main into this branch before building'
+        type: boolean
+        default: true
+      publish:
+        description: 'Update the rolling GitHub Release'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -22,8 +35,78 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Runs only on schedule and on a manual dispatch that asked for it. Merges
+  # upstream so the fork tracks pi, then pushes with [skip ci] so the push does
+  # not also fire the matrix below; this run does the build instead.
+  sync_upstream:
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.sync) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the merge can reach upstream commits and so the patch
+          # keeps the blobs it needs for a three-way apply.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge upstream main
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream https://github.com/earendil-works/pi.git
+          git fetch --no-tags upstream main
+
+          before="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          echo "fork    : ${before}"
+          echo "upstream: ${upstream_sha}"
+
+          if git merge-base --is-ancestor "${upstream_sha}" "${before}"; then
+            echo "already up to date with upstream"
+            echo "sync_status=uptodate" >> "${GITHUB_ENV}"
+            exit 0
+          fi
+
+          # Keep the message on one source line: a bare continuation line would
+          # terminate this YAML block scalar.
+          merge_message="$(printf 'chore: merge upstream main into fork\n\n[skip ci]\n')"
+
+          if ! git merge --no-ff --no-edit -m "${merge_message}" "${upstream_sha}"; then
+            git merge --abort || true
+            printf '%s\n' \
+              '' \
+              '::error::Merging upstream main conflicts. Resolve locally, then push:' \
+              '' \
+              '  git remote add upstream https://github.com/earendil-works/pi.git' \
+              '  git fetch upstream main' \
+              '  git merge upstream/main' \
+              '  git push origin main' \
+              '' \
+              '::error::Then regenerate patches/google-aas.patch from the merged tree if it no longer applies.' \
+              >&2
+            exit 1
+          fi
+
+          git push origin HEAD:main
+          echo "sync_status=merged" >> "${GITHUB_ENV}"
+          echo "merged ${before}..${upstream_sha}"
+
+      - name: Summarise
+        run: |
+          echo "sync status: ${sync_status}"
+          git log --oneline -1
+
   build:
     name: ${{ matrix.label }}
+    needs: sync_upstream
+    # `needs` with a skipped job would skip this too, so opt back in explicitly.
+    if: ${{ !cancelled() && needs.sync_upstream.result != 'failure' }}
     runs-on: ${{ matrix.runner }}
     # contents: write is only needed to publish the rolling GitHub Release.
     permissions:
@@ -151,6 +234,8 @@ jobs:
           retention-days: 30
 
       - name: Publish to GitHub Release
+        # Publish on push and schedule; only an explicit dispatch can opt out.
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish != false }}
         # Rolling release: one tag per platform that always holds the newest
         # successful build, so `releases/download/<tag>/` stays a stable URL
         # instead of producing a release per commit.

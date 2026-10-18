@@ -18,7 +18,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_FILE="$SCRIPT_DIR/google-aas.patch"
-REPO="${PI_REPO:-/Users/macbook/Downloads/pi}"
+
+# Default to the checkout that holds this script, so the repo works wherever it
+# is cloned. PI_REPO overrides, which is what CI and a detached patch dir need.
+# A hardcoded path here would silently target some other checkout.
+REPO="${PI_REPO:-$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)}"
+REPO="${REPO:-$SCRIPT_DIR/..}"
 
 MODE="apply"
 case "${1:-}" in

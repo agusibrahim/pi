@@ -36,7 +36,7 @@ tree. The GitHub Actions workflow applies the patch with the same logic.
 ./patches/apply.sh --verify   # apply, then run the patch's tests
 ```
 
-It defaults to `/Users/macbook/Downloads/pi`; override with `PI_REPO=/path/pi`.
+It defaults to the checkout that holds the script; override with `PI_REPO=/path/pi`.
 
 ## Caveat
 
