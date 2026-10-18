@@ -15,7 +15,7 @@ on:
   # Weekly upstream sync, then rebuild so the rolling release binary never goes
   # stale. Every Monday 05:17 UTC; change the cron to move the day.
   schedule:
-    - cron: '17 5 * * 1'
+    - cron: '16 11 * * *'
   workflow_dispatch:
     inputs:
       sync:
