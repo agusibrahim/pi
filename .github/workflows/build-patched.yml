@@ -208,11 +208,17 @@ jobs:
           echo "patched files:"
           git status --porcelain
 
-      - name: Hydrate model data
-        run: npm run hydrate:model-data
-
       - name: Install dependencies
         run: npm ci --ignore-scripts
+
+      - name: Generate model catalog
+        # Regenerates packages/ai/src/models.generated.ts and the provider data.
+        # This has to write models.generated.ts, not just the data: upstream's
+        # own CI regenerates it before `npm run check`, so its tests type-check
+        # against a freshly generated catalog. Hydrating only the data leaves
+        # the committed catalog in place, and after an upstream bump the tests
+        # then reference model ids the stale catalog does not have.
+        run: npm --prefix packages/ai run generate-models
 
       - name: Check
         run: npm run check
