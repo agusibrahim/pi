@@ -45,11 +45,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          args=(--workflow "${TARGET_WORKFLOW}" --ref "${TARGET_REF}")
+          args=(--ref "${TARGET_REF}")
           args+=(-f "sync=${SYNC}" -f "publish=${PUBLISH}")
 
           echo "dispatching ${TARGET_WORKFLOW} (ref=${TARGET_REF}, sync=${SYNC}, publish=${PUBLISH})"
-          gh workflow run "${args[@]}"
+          gh workflow run "${TARGET_WORKFLOW}" "${args[@]}"
 
           sleep 5
           gh run list --workflow "${TARGET_WORKFLOW}" --limit 1 \

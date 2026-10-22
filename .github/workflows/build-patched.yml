@@ -50,7 +50,10 @@ jobs:
           # Full history so the merge can reach upstream commits and so the patch
           # keeps the blobs it needs for a three-way apply.
           fetch-depth: 0
-          persist-credentials: false
+          # The sync job pushes the merge back, so the checkout has to keep its
+          # token. Without this the merge succeeds and `git push` fails with
+          # "could not read Username for 'https://github.com'".
+          persist-credentials: true
 
       - name: Merge upstream main
         run: |
