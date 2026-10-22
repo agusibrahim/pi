@@ -106,6 +106,13 @@ jobs:
           else
             echo "keeping the fork's .github/workflows (upstream CI files are unused here)"
             git checkout HEAD^1 -- .github/workflows
+            # `git checkout <tree> -- <path>` only updates paths the tree has, so
+            # workflow files upstream added stay in the index. Drop them, or the
+            # push still creates a workflow file and gets rejected.
+            git diff --cached --name-only --diff-filter=A HEAD^1 -- .github/workflows |
+              while read -r added; do
+                [ -n "${added}" ] && git rm -q --cached --ignore-unmatch -- "${added}"
+              done
             git commit --amend --no-edit
             # The checkout drops upstream-only workflow files from the index,
             # so the commit's tree no longer differs from HEAD^1 here.
