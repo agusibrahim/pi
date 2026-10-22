@@ -43,9 +43,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      # The merge brings upstream's own workflow files along, and GitHub refuses
-      # a GITHUB_TOKEN push that touches .github/workflows/ without this scope.
-      workflows: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -97,6 +94,23 @@ jobs:
               '::error::Then regenerate patches/google-aas.patch from the merged tree if it no longer applies.' \
               >&2
             exit 1
+          fi
+
+          # GitHub refuses a GITHUB_TOKEN push that modifies anything under
+          # .github/workflows/, and no `permissions:` scope lifts that. The
+          # merge brings upstream's own CI files along, so put the fork's
+          # versions back before pushing: this fork does not run upstream's CI
+          # (ci.yml is disabled), it only needs upstream's source.
+          if git diff --quiet HEAD^1 HEAD -- .github/workflows; then
+            echo "upstream did not touch .github/workflows"
+          else
+            echo "keeping the fork's .github/workflows (upstream CI files are unused here)"
+            git checkout HEAD^1 -- .github/workflows
+            git commit --amend --no-edit
+            # The checkout drops upstream-only workflow files from the index,
+            # so the commit's tree no longer differs from HEAD^1 here.
+            git diff --quiet HEAD^1 HEAD -- .github/workflows ||
+              { echo '::error::could not restore .github/workflows'; exit 1; }
           fi
 
           git push origin HEAD:main
