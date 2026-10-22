@@ -1,5 +1,5 @@
 diff --git a/packages/ai/CHANGELOG.md b/packages/ai/CHANGELOG.md
-index b06b70252..a2bcc7aee 100644
+index 74aa15c4d..559441fee 100644
 --- a/packages/ai/CHANGELOG.md
 +++ b/packages/ai/CHANGELOG.md
 @@ -2,6 +2,10 @@
@@ -12,9 +12,9 @@ index b06b70252..a2bcc7aee 100644
 +
  ### Fixed
  
- - Fixed whitespace-only tool output (for example a bare `\r\n` from bash) being sent as-is to OpenAI Completions, OpenAI Responses, and Google providers; it now uses the same placeholder as empty output, since some providers reject whitespace-only tool content with a 400 ([#8720](https://github.com/earendil-works/pi/issues/8720))
+ - Fixed Claude models that accept mid-conversation system messages rejecting a session with a 400 (`role 'system' must precede an 'assistant' message`) when a system update was followed by an assistant reply with nothing to send to Anthropic, such as an empty reply or another model's reasoning-only reply ([#11091](https://github.com/earendil-works/pi/issues/11091))
 diff --git a/packages/ai/src/api/google-generative-ai.ts b/packages/ai/src/api/google-generative-ai.ts
-index 24fe9134c..c7ecdaf78 100644
+index 5e44ce2a4..a9ac1d259 100644
 --- a/packages/ai/src/api/google-generative-ai.ts
 +++ b/packages/ai/src/api/google-generative-ai.ts
 @@ -9,7 +9,6 @@ import type {
@@ -33,8 +33,8 @@ index 24fe9134c..c7ecdaf78 100644
 -			if (!apiKey) {
 -				throw new Error(`No API key for provider: ${model.provider}`);
 -			}
--			const client = createClient(model, apiKey, options?.headers);
-+			const client = createClient(model, resolveRequestAuth(model, options));
+-			const client = createClient(model, apiKey, options?.headers, options?.identity);
++			const client = createClient(model, resolveRequestAuth(model, options), options?.identity);
  			let params = buildParams(model, normalizedContext, options);
  			const nextParams = await options?.onPayload?.(params, model);
  			if (nextParams !== undefined) {
@@ -55,11 +55,10 @@ index 24fe9134c..c7ecdaf78 100644
  		toolChoice: options?.toolChoice,
  	} satisfies GoogleOptions;
  	if (!options?.reasoning) {
-@@ -345,19 +338,66 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
+@@ -345,10 +338,53 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
  	} satisfies GoogleOptions);
  };
  
--function createClient(
 +type GoogleRequestAuth =
 +	| { kind: "api_key"; apiKey: string; headers?: Record<string, string> }
 +	| { kind: "bearer"; headers: Record<string, string> };
@@ -73,19 +72,17 @@ index 24fe9134c..c7ecdaf78 100644
 + * Resolve how this request authenticates against the Gemini Developer API.
 + *
 + * `@google/genai` turns any `apiKey` into an `x-goog-api-key` header, and the
-+ * API only accepts Gemini API keys there — an OAuth access token sent that way
++ * API only accepts Gemini API keys there - an OAuth access token sent that way
 + * fails with `API_KEY_INVALID` even when the same token works as
 + * `Authorization: Bearer`. So a caller-supplied Authorization header selects the
 + * bearer path, which never hands the token to the SDK as an API key.
 + */
 +function resolveRequestAuth(
- 	model: Model<"google-generative-ai">,
--	apiKey?: string,
--	optionsHeaders?: ProviderHeaders,
--): GoogleGenAI {
++	model: Model<"google-generative-ai">,
 +	options?: Pick<GoogleOptions, "apiKey" | "headers">,
++	identity?: ClientIdentity,
 +): GoogleRequestAuth {
-+	const headers = providerHeadersToRecord({ "User-Agent": getPiUserAgent(), ...model.headers, ...options?.headers });
++	const headers = providerHeadersToRecord(getIdentityHeaders(model, identity), model.headers, options?.headers);
 +	if (headers && hasHeader(headers, "authorization")) return { kind: "bearer", headers };
 +	if (!options?.apiKey) {
 +		throw new Error(`No API key or OAuth token for provider: ${model.provider}`);
@@ -106,112 +103,37 @@ index 24fe9134c..c7ecdaf78 100644
 + */
 +const BEARER_API_KEY_PLACEHOLDER = "bearer";
 +
-+function createClient(model: Model<"google-generative-ai">, auth: GoogleRequestAuth): GoogleGenAI {
+ function createClient(
+ 	model: Model<"google-generative-ai">,
+-	apiKey?: string,
+-	optionsHeaders?: ProviderHeaders,
++	auth: GoogleRequestAuth,
+ 	identity?: ClientIdentity,
+ ): GoogleGenAI {
  	const httpOptions: { baseUrl?: string; apiVersion?: string; headers?: Record<string, string> } = {};
- 	if (model.baseUrl) {
+@@ -356,11 +392,21 @@ function createClient(
  		httpOptions.baseUrl = model.baseUrl;
  		httpOptions.apiVersion = ""; // baseUrl already includes version path, don't append
  	}
--	const headers = providerHeadersToRecord({ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders });
--	if (headers) {
--		httpOptions.headers = headers;
-+
+-	const headers = providerHeadersToRecord(getIdentityHeaders(model, identity), model.headers, optionsHeaders);
++	const headers = providerHeadersToRecord(getIdentityHeaders(model, identity), model.headers, auth.headers);
+ 	if (headers) {
+ 		httpOptions.headers = headers;
+ 	}
+ 
 +	let apiKey: string | undefined;
 +	if (auth.kind === "bearer") {
 +		apiKey = BEARER_API_KEY_PLACEHOLDER;
-+		httpOptions.headers = { ...auth.headers };
-+		if (!hasHeader(httpOptions.headers, "x-goog-api-key")) {
-+			httpOptions.headers["x-goog-api-key"] = "";
++		if (!hasHeader(httpOptions.headers ?? {}, "x-goog-api-key")) {
++			httpOptions.headers = { ...httpOptions.headers, "x-goog-api-key": "" };
 +		}
 +	} else {
 +		apiKey = auth.apiKey;
-+		if (auth.headers) httpOptions.headers = auth.headers;
- 	}
- 
- 	return new GoogleGenAI({
-diff --git a/packages/ai/src/auth/oauth/load.ts b/packages/ai/src/auth/oauth/load.ts
-index 839fe3152..5121da78b 100644
---- a/packages/ai/src/auth/oauth/load.ts
-+++ b/packages/ai/src/auth/oauth/load.ts
-@@ -18,6 +18,7 @@ type OAuthFlowLoaders = {
- 	githubCopilot: () => OAuthAuth | Promise<OAuthAuth>;
- 	openrouter: () => OAuthAuth | Promise<OAuthAuth>;
- 	kimiCoding: () => OAuthAuth | Promise<OAuthAuth>;
-+	google: () => OAuthAuth | Promise<OAuthAuth>;
- 	meta: () => OAuthAuth | Promise<OAuthAuth>;
- 	xai: () => OAuthAuth | Promise<OAuthAuth>;
- 	radius: (options: { name: string; gateway: string }) => OAuthAuth | Promise<OAuthAuth>;
-@@ -60,6 +61,11 @@ export const loadKimiCodingOAuth = async (): Promise<OAuthAuth> => {
- 	return ((await importOAuthModule("./kimi-coding.ts")) as { kimiCodingOAuth: OAuthAuth }).kimiCodingOAuth;
- };
- 
-+export const loadGoogleOAuth = async (): Promise<OAuthAuth> => {
-+	if (bundledLoaders) return bundledLoaders.google();
-+	return ((await importOAuthModule("./google.ts")) as { googleOAuth: OAuthAuth }).googleOAuth;
-+};
++	}
 +
- export const loadMetaOAuth = async (): Promise<OAuthAuth> => {
- 	if (bundledLoaders) return bundledLoaders.meta();
- 	return ((await importOAuthModule("./meta.ts")) as { metaOAuth: OAuthAuth }).metaOAuth;
-diff --git a/packages/ai/src/bun-oauth.ts b/packages/ai/src/bun-oauth.ts
-index 5e77cf1b6..69ce3901c 100644
---- a/packages/ai/src/bun-oauth.ts
-+++ b/packages/ai/src/bun-oauth.ts
-@@ -1,5 +1,6 @@
- import { anthropicOAuth } from "./auth/oauth/anthropic.ts";
- import { githubCopilotOAuth } from "./auth/oauth/github-copilot.ts";
-+import { googleOAuth } from "./auth/oauth/google.ts";
- import { kimiCodingOAuth } from "./auth/oauth/kimi-coding.ts";
- import { registerBundledOAuthFlowLoaders } from "./auth/oauth/load.ts";
- import { metaOAuth } from "./auth/oauth/meta.ts";
-@@ -18,6 +19,7 @@ export function registerBunOAuthFlows(): void {
- 		githubCopilot: () => githubCopilotOAuth,
- 		openrouter: () => openRouterOAuth,
- 		kimiCoding: () => kimiCodingOAuth,
-+		google: () => googleOAuth,
- 		meta: () => metaOAuth,
- 		xai: () => xaiOAuth,
- 		radius: createRadiusOAuth,
-diff --git a/packages/ai/src/providers/google.ts b/packages/ai/src/providers/google.ts
-index 0bd452373..c9e17240c 100644
---- a/packages/ai/src/providers/google.ts
-+++ b/packages/ai/src/providers/google.ts
-@@ -1,5 +1,6 @@
- import { googleGenerativeAIApi } from "../api/google-generative-ai.lazy.ts";
--import { envApiKeyAuth } from "../auth/helpers.ts";
-+import { envApiKeyAuth, lazyOAuth } from "../auth/helpers.ts";
-+import { loadGoogleOAuth } from "../auth/oauth/load.ts";
- import { createProvider, type Provider } from "../models.ts";
- import { GOOGLE_MODELS } from "./google.models.ts";
- 
-@@ -8,7 +9,14 @@ export function googleProvider(): Provider<"google-generative-ai"> {
- 		id: "google",
- 		name: "Google",
- 		baseUrl: "https://generativelanguage.googleapis.com/v1beta",
--		auth: { apiKey: envApiKeyAuth("Gemini API key", ["GEMINI_API_KEY"]) },
-+		auth: {
-+			apiKey: envApiKeyAuth("Gemini API key", ["GEMINI_API_KEY"]),
-+			oauth: lazyOAuth({
-+				name: "Google Gemini (Android AAS)",
-+				loginLabel: "Sign in with a Google Android AAS token",
-+				load: loadGoogleOAuth,
-+			}),
-+		},
- 		models: Object.values(GOOGLE_MODELS),
- 		api: googleGenerativeAIApi(),
- 	});
-diff --git a/scripts/build-coding-agent-bundle.mjs b/scripts/build-coding-agent-bundle.mjs
-index d2f622d6b..013515fea 100644
---- a/scripts/build-coding-agent-bundle.mjs
-+++ b/scripts/build-coding-agent-bundle.mjs
-@@ -182,6 +182,7 @@ const lazyEntryPoints = {
- 	anthropic: join(aiDistDir, "auth", "oauth", "anthropic.js"),
- 	"bedrock-converse-stream": join(aiDistDir, "api", "bedrock-converse-stream.js"),
- 	"github-copilot": join(aiDistDir, "auth", "oauth", "github-copilot.js"),
-+	google: join(aiDistDir, "auth", "oauth", "google.js"),
- 	"image-resize-worker": join(codingAgentDistDir, "utils", "image-resize-worker.js"),
- 	"kimi-coding": join(aiDistDir, "auth", "oauth", "kimi-coding.js"),
- 	meta: join(aiDistDir, "auth", "oauth", "meta.js"),
+ 	return new GoogleGenAI({
+ 		apiKey,
+ 		httpOptions: Object.keys(httpOptions).length > 0 ? httpOptions : undefined,
 diff --git a/packages/ai/src/auth/oauth/google.ts b/packages/ai/src/auth/oauth/google.ts
 new file mode 100644
 index 000000000..2fc292df3
@@ -446,6 +368,225 @@ index 000000000..2fc292df3
 +		return { headers: { Authorization: `Bearer ${credential.access}` } };
 +	},
 +};
+diff --git a/packages/ai/src/auth/oauth/load.ts b/packages/ai/src/auth/oauth/load.ts
+index 839fe3152..5121da78b 100644
+--- a/packages/ai/src/auth/oauth/load.ts
++++ b/packages/ai/src/auth/oauth/load.ts
+@@ -18,6 +18,7 @@ type OAuthFlowLoaders = {
+ 	githubCopilot: () => OAuthAuth | Promise<OAuthAuth>;
+ 	openrouter: () => OAuthAuth | Promise<OAuthAuth>;
+ 	kimiCoding: () => OAuthAuth | Promise<OAuthAuth>;
++	google: () => OAuthAuth | Promise<OAuthAuth>;
+ 	meta: () => OAuthAuth | Promise<OAuthAuth>;
+ 	xai: () => OAuthAuth | Promise<OAuthAuth>;
+ 	radius: (options: { name: string; gateway: string }) => OAuthAuth | Promise<OAuthAuth>;
+@@ -60,6 +61,11 @@ export const loadKimiCodingOAuth = async (): Promise<OAuthAuth> => {
+ 	return ((await importOAuthModule("./kimi-coding.ts")) as { kimiCodingOAuth: OAuthAuth }).kimiCodingOAuth;
+ };
+ 
++export const loadGoogleOAuth = async (): Promise<OAuthAuth> => {
++	if (bundledLoaders) return bundledLoaders.google();
++	return ((await importOAuthModule("./google.ts")) as { googleOAuth: OAuthAuth }).googleOAuth;
++};
++
+ export const loadMetaOAuth = async (): Promise<OAuthAuth> => {
+ 	if (bundledLoaders) return bundledLoaders.meta();
+ 	return ((await importOAuthModule("./meta.ts")) as { metaOAuth: OAuthAuth }).metaOAuth;
+diff --git a/packages/ai/src/bun-oauth.ts b/packages/ai/src/bun-oauth.ts
+index 5e77cf1b6..69ce3901c 100644
+--- a/packages/ai/src/bun-oauth.ts
++++ b/packages/ai/src/bun-oauth.ts
+@@ -1,5 +1,6 @@
+ import { anthropicOAuth } from "./auth/oauth/anthropic.ts";
+ import { githubCopilotOAuth } from "./auth/oauth/github-copilot.ts";
++import { googleOAuth } from "./auth/oauth/google.ts";
+ import { kimiCodingOAuth } from "./auth/oauth/kimi-coding.ts";
+ import { registerBundledOAuthFlowLoaders } from "./auth/oauth/load.ts";
+ import { metaOAuth } from "./auth/oauth/meta.ts";
+@@ -18,6 +19,7 @@ export function registerBunOAuthFlows(): void {
+ 		githubCopilot: () => githubCopilotOAuth,
+ 		openrouter: () => openRouterOAuth,
+ 		kimiCoding: () => kimiCodingOAuth,
++		google: () => googleOAuth,
+ 		meta: () => metaOAuth,
+ 		xai: () => xaiOAuth,
+ 		radius: createRadiusOAuth,
+diff --git a/packages/ai/src/providers/google.ts b/packages/ai/src/providers/google.ts
+index 0bd452373..c9e17240c 100644
+--- a/packages/ai/src/providers/google.ts
++++ b/packages/ai/src/providers/google.ts
+@@ -1,5 +1,6 @@
+ import { googleGenerativeAIApi } from "../api/google-generative-ai.lazy.ts";
+-import { envApiKeyAuth } from "../auth/helpers.ts";
++import { envApiKeyAuth, lazyOAuth } from "../auth/helpers.ts";
++import { loadGoogleOAuth } from "../auth/oauth/load.ts";
+ import { createProvider, type Provider } from "../models.ts";
+ import { GOOGLE_MODELS } from "./google.models.ts";
+ 
+@@ -8,7 +9,14 @@ export function googleProvider(): Provider<"google-generative-ai"> {
+ 		id: "google",
+ 		name: "Google",
+ 		baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+-		auth: { apiKey: envApiKeyAuth("Gemini API key", ["GEMINI_API_KEY"]) },
++		auth: {
++			apiKey: envApiKeyAuth("Gemini API key", ["GEMINI_API_KEY"]),
++			oauth: lazyOAuth({
++				name: "Google Gemini (Android AAS)",
++				loginLabel: "Sign in with a Google Android AAS token",
++				load: loadGoogleOAuth,
++			}),
++		},
+ 		models: Object.values(GOOGLE_MODELS),
+ 		api: googleGenerativeAIApi(),
+ 	});
+diff --git a/packages/ai/test/google-oauth-bearer.test.ts b/packages/ai/test/google-oauth-bearer.test.ts
+new file mode 100644
+index 000000000..8dbf0bd60
+--- /dev/null
++++ b/packages/ai/test/google-oauth-bearer.test.ts
+@@ -0,0 +1,142 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const googleGenAiMock = vi.hoisted(() => ({
++	constructorCalls: [] as Array<Record<string, unknown>>,
++}));
++
++vi.mock("@google/genai", () => {
++	class GoogleGenAI {
++		models = {
++			generateContentStream: async function* () {
++				yield {
++					responseId: "gemini-response-id",
++					candidates: [
++						{
++							content: { parts: [{ text: "ok" }] },
++							finishReason: "STOP",
++						},
++					],
++					usageMetadata: {
++						promptTokenCount: 1,
++						candidatesTokenCount: 1,
++						totalTokenCount: 2,
++					},
++				};
++			},
++		};
++
++		constructor(config: Record<string, unknown>) {
++			googleGenAiMock.constructorCalls.push(config);
++		}
++	}
++
++	return {
++		GoogleGenAI,
++		ThinkingLevel: {
++			THINKING_LEVEL_UNSPECIFIED: "THINKING_LEVEL_UNSPECIFIED",
++			MINIMAL: "MINIMAL",
++			LOW: "LOW",
++			MEDIUM: "MEDIUM",
++			HIGH: "HIGH",
++		},
++	};
++});
++
++import { stream as streamGoogle } from "../src/api/google-generative-ai.ts";
++import { getModel, normalizeContext } from "../src/compat.ts";
++
++const model = getModel("google", "gemini-3-flash-preview");
++const context = normalizeContext({
++	messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
++});
++
++function lastClient(): Record<string, unknown> {
++	const calls = googleGenAiMock.constructorCalls;
++	if (calls.length !== 1) throw new Error(`Expected exactly one GoogleGenAI call, got ${calls.length}`);
++	return calls[0] as Record<string, unknown>;
++}
++
++function clientHeaders(): Record<string, string> {
++	return (lastClient().httpOptions as { headers: Record<string, string> }).headers;
++}
++
++/**
++ * The Gemini Developer API accepts OAuth access tokens only as
++ * `Authorization: Bearer`. `@google/genai` derives `x-goog-api-key` from any
++ * `apiKey` and the API answers `API_KEY_INVALID` for an OAuth token there, so
++ * the bearer path must suppress the apiKey entirely.
++ */
++describe("google bearer auth", () => {
++	beforeEach(() => {
++		googleGenAiMock.constructorCalls.length = 0;
++	});
++
++	afterEach(() => {
++		vi.restoreAllMocks();
++		vi.unstubAllGlobals();
++	});
++
++	it("sends an OAuth token as a bearer header and no api key", async () => {
++		const stream = streamGoogle(model, context, {
++			headers: { Authorization: "Bearer ya29.test-access-token" },
++		});
++
++		await stream.result();
++
++		expect(clientHeaders()).toMatchObject({ Authorization: "Bearer ya29.test-access-token" });
++		// The SDK treats an undefined apiKey as "use Application Default
++		// Credentials" and then fails with "Could not load the default
++		// credentials", so it gets a placeholder instead. Pre-setting
++		// x-goog-api-key keeps the SDK from sending that placeholder.
++		expect(lastClient().apiKey).toBeTruthy();
++		expect(clientHeaders()["x-goog-api-key"]).toBe("");
++	});
++
++	it("prefers the bearer header over an api key that would become x-goog-api-key", async () => {
++		const stream = streamGoogle(model, context, {
++			apiKey: "AIzaSyExampleRealisticLookingApiKey123456",
++			headers: { authorization: "Bearer ya29.test-access-token" },
++		});
++
++		await stream.result();
++
++		expect(lastClient().apiKey).not.toBe("AIzaSyExampleRealisticLookingApiKey123456");
++		expect(clientHeaders().authorization).toBe("Bearer ya29.test-access-token");
++	});
++
++	it("does not overwrite a caller-supplied x-goog-api-key", async () => {
++		const stream = streamGoogle(model, context, {
++			headers: {
++				Authorization: "Bearer ya29.test-access-token",
++				"X-Goog-Api-Key": "caller-value",
++			},
++		});
++
++		await stream.result();
++
++		const apiKeyHeader = Object.entries(clientHeaders()).find(([name]) => name.toLowerCase() === "x-goog-api-key");
++		expect(apiKeyHeader?.[1]).toBe("caller-value");
++	});
++
++	it("still passes through api keys unchanged", async () => {
++		const stream = streamGoogle(model, context, {
++			apiKey: "AIzaSyExampleRealisticLookingApiKey123456",
++		});
++
++		await stream.result();
++
++		expect(lastClient().apiKey).toBe("AIzaSyExampleRealisticLookingApiKey123456");
++		expect(clientHeaders()).not.toHaveProperty("Authorization");
++		expect(clientHeaders()).not.toHaveProperty("authorization");
++	});
++
++	it("fails with a clear message when no credential is available", async () => {
++		const stream = streamGoogle(model, context, {});
++
++		const result = await stream.result();
++
++		expect(result.stopReason).toBe("error");
++		expect(result.errorMessage).toContain("No API key or OAuth token for provider: google");
++		expect(googleGenAiMock.constructorCalls).toHaveLength(0);
++	});
++});
 diff --git a/packages/ai/test/google-oauth.test.ts b/packages/ai/test/google-oauth.test.ts
 new file mode 100644
 index 000000000..06ed2a7c0
@@ -697,151 +838,15 @@ index 000000000..06ed2a7c0
 +		expect(credential.expires).toBe(Date.now() + 55 * 60 * 1000);
 +	});
 +});
-diff --git a/packages/ai/test/google-oauth-bearer.test.ts b/packages/ai/test/google-oauth-bearer.test.ts
-new file mode 100644
-index 000000000..8dbf0bd60
---- /dev/null
-+++ b/packages/ai/test/google-oauth-bearer.test.ts
-@@ -0,0 +1,142 @@
-+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-+
-+const googleGenAiMock = vi.hoisted(() => ({
-+	constructorCalls: [] as Array<Record<string, unknown>>,
-+}));
-+
-+vi.mock("@google/genai", () => {
-+	class GoogleGenAI {
-+		models = {
-+			generateContentStream: async function* () {
-+				yield {
-+					responseId: "gemini-response-id",
-+					candidates: [
-+						{
-+							content: { parts: [{ text: "ok" }] },
-+							finishReason: "STOP",
-+						},
-+					],
-+					usageMetadata: {
-+						promptTokenCount: 1,
-+						candidatesTokenCount: 1,
-+						totalTokenCount: 2,
-+					},
-+				};
-+			},
-+		};
-+
-+		constructor(config: Record<string, unknown>) {
-+			googleGenAiMock.constructorCalls.push(config);
-+		}
-+	}
-+
-+	return {
-+		GoogleGenAI,
-+		ThinkingLevel: {
-+			THINKING_LEVEL_UNSPECIFIED: "THINKING_LEVEL_UNSPECIFIED",
-+			MINIMAL: "MINIMAL",
-+			LOW: "LOW",
-+			MEDIUM: "MEDIUM",
-+			HIGH: "HIGH",
-+		},
-+	};
-+});
-+
-+import { stream as streamGoogle } from "../src/api/google-generative-ai.ts";
-+import { getModel, normalizeContext } from "../src/compat.ts";
-+
-+const model = getModel("google", "gemini-3-flash-preview");
-+const context = normalizeContext({
-+	messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
-+});
-+
-+function lastClient(): Record<string, unknown> {
-+	const calls = googleGenAiMock.constructorCalls;
-+	if (calls.length !== 1) throw new Error(`Expected exactly one GoogleGenAI call, got ${calls.length}`);
-+	return calls[0] as Record<string, unknown>;
-+}
-+
-+function clientHeaders(): Record<string, string> {
-+	return (lastClient().httpOptions as { headers: Record<string, string> }).headers;
-+}
-+
-+/**
-+ * The Gemini Developer API accepts OAuth access tokens only as
-+ * `Authorization: Bearer`. `@google/genai` derives `x-goog-api-key` from any
-+ * `apiKey` and the API answers `API_KEY_INVALID` for an OAuth token there, so
-+ * the bearer path must suppress the apiKey entirely.
-+ */
-+describe("google bearer auth", () => {
-+	beforeEach(() => {
-+		googleGenAiMock.constructorCalls.length = 0;
-+	});
-+
-+	afterEach(() => {
-+		vi.restoreAllMocks();
-+		vi.unstubAllGlobals();
-+	});
-+
-+	it("sends an OAuth token as a bearer header and no api key", async () => {
-+		const stream = streamGoogle(model, context, {
-+			headers: { Authorization: "Bearer ya29.test-access-token" },
-+		});
-+
-+		await stream.result();
-+
-+		expect(clientHeaders()).toMatchObject({ Authorization: "Bearer ya29.test-access-token" });
-+		// The SDK treats an undefined apiKey as "use Application Default
-+		// Credentials" and then fails with "Could not load the default
-+		// credentials", so it gets a placeholder instead. Pre-setting
-+		// x-goog-api-key keeps the SDK from sending that placeholder.
-+		expect(lastClient().apiKey).toBeTruthy();
-+		expect(clientHeaders()["x-goog-api-key"]).toBe("");
-+	});
-+
-+	it("prefers the bearer header over an api key that would become x-goog-api-key", async () => {
-+		const stream = streamGoogle(model, context, {
-+			apiKey: "AIzaSyExampleRealisticLookingApiKey123456",
-+			headers: { authorization: "Bearer ya29.test-access-token" },
-+		});
-+
-+		await stream.result();
-+
-+		expect(lastClient().apiKey).not.toBe("AIzaSyExampleRealisticLookingApiKey123456");
-+		expect(clientHeaders().authorization).toBe("Bearer ya29.test-access-token");
-+	});
-+
-+	it("does not overwrite a caller-supplied x-goog-api-key", async () => {
-+		const stream = streamGoogle(model, context, {
-+			headers: {
-+				Authorization: "Bearer ya29.test-access-token",
-+				"X-Goog-Api-Key": "caller-value",
-+			},
-+		});
-+
-+		await stream.result();
-+
-+		const apiKeyHeader = Object.entries(clientHeaders()).find(([name]) => name.toLowerCase() === "x-goog-api-key");
-+		expect(apiKeyHeader?.[1]).toBe("caller-value");
-+	});
-+
-+	it("still passes through api keys unchanged", async () => {
-+		const stream = streamGoogle(model, context, {
-+			apiKey: "AIzaSyExampleRealisticLookingApiKey123456",
-+		});
-+
-+		await stream.result();
-+
-+		expect(lastClient().apiKey).toBe("AIzaSyExampleRealisticLookingApiKey123456");
-+		expect(clientHeaders()).not.toHaveProperty("Authorization");
-+		expect(clientHeaders()).not.toHaveProperty("authorization");
-+	});
-+
-+	it("fails with a clear message when no credential is available", async () => {
-+		const stream = streamGoogle(model, context, {});
-+
-+		const result = await stream.result();
-+
-+		expect(result.stopReason).toBe("error");
-+		expect(result.errorMessage).toContain("No API key or OAuth token for provider: google");
-+		expect(googleGenAiMock.constructorCalls).toHaveLength(0);
-+	});
-+});
+diff --git a/scripts/build-coding-agent-bundle.mjs b/scripts/build-coding-agent-bundle.mjs
+index d2f622d6b..013515fea 100644
+--- a/scripts/build-coding-agent-bundle.mjs
++++ b/scripts/build-coding-agent-bundle.mjs
+@@ -182,6 +182,7 @@ const lazyEntryPoints = {
+ 	anthropic: join(aiDistDir, "auth", "oauth", "anthropic.js"),
+ 	"bedrock-converse-stream": join(aiDistDir, "api", "bedrock-converse-stream.js"),
+ 	"github-copilot": join(aiDistDir, "auth", "oauth", "github-copilot.js"),
++	google: join(aiDistDir, "auth", "oauth", "google.js"),
+ 	"image-resize-worker": join(codingAgentDistDir, "utils", "image-resize-worker.js"),
+ 	"kimi-coding": join(aiDistDir, "auth", "oauth", "kimi-coding.js"),
+ 	meta: join(aiDistDir, "auth", "oauth", "meta.js"),
