@@ -1,0 +1,56 @@
+name: 'Manual: Sync, Build & Publish'
+
+# A clearly named manual entry point. The actual work lives in
+# build-patched.yml, which already supports workflow_dispatch; this workflow only
+# re-dispatches it so the trigger is obvious in the Actions tab and can be run
+# from the CLI without remembering the workflow filename and input names.
+#
+#   gh workflow run manual-release.yml --ref main
+#
+# It re-dispatches instead of calling build-patched.yml via workflow_call on
+# purpose: a called workflow sees the caller's event name, and build-patched.yml
+# keys its weekly sync off `github.event_name == 'schedule'`. Re-dispatching
+# leaves that logic untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync:
+        description: 'Merge upstream main into this branch first'
+        type: boolean
+        default: true
+      publish:
+        description: 'Update the rolling GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  # actions: write is needed to dispatch another workflow.
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch patched build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger build-patched.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_WORKFLOW: build-patched.yml
+          TARGET_REF: ${{ github.ref_name }}
+          SYNC: ${{ inputs.sync }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+
+          args=(--workflow "${TARGET_WORKFLOW}" --ref "${TARGET_REF}")
+          args+=(-f "sync=${SYNC}" -f "publish=${PUBLISH}")
+
+          echo "dispatching ${TARGET_WORKFLOW} (ref=${TARGET_REF}, sync=${SYNC}, publish=${PUBLISH})"
+          gh workflow run "${args[@]}"
+
+          sleep 5
+          gh run list --workflow "${TARGET_WORKFLOW}" --limit 1 \
+            --json databaseId,status,event,url -q '.[] | "run \(.databaseId) \(.event) \(.status)\n\(.url)"'
