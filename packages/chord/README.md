@@ -14,7 +14,7 @@ Contracts are runtime values described with [TypeBox](https://github.com/sinclai
 
 | Import | Contents | Runs in |
 |--------|----------|---------|
-| `@earendil-works/chord` | Contracts (`local`, `remote`, `method`, `opaque`), declarations (through the factory's `self`: `state`, `derive`, `resource`, `on`, `task`), hosts (`createHost`, `defineFacet`, `defineRegistry`), links (`memoryLinkPair`, `ipcLink`, `webSocketLink`, `acceptWebSockets`), errors (`ChordError`, `isChordError`, `forbidden`, `invalid`). Also the shared base: `Context`, `JsonValue`, `JsonRepresentation`, `Draft`, `copyJson`, `isJsonValue`, `replicatedState` with its types, and the watch types `WatchHandle` and `WatchEnd`. | Node and browsers |
+| `@earendil-works/chord` | Contracts (`local`, `remote`, `method`, `opaque`), declarations (through the factory's `self`: `state`, `derive`, `resource`, `on`, `task`), hosts (`createHost`, `defineFacet`, `defineRegistry`), links (`memoryLinkPair`, `ipcLink`, `webSocketLink`, `acceptWebSockets`), errors (`ChordError`, `isChordError`, `forbidden`, `invalid`). Also the shared base: `Context`, `JsonValue`, `JsonRepresentation`, `Draft`, `copyJson`, `isJsonValue`, `replicatedState` with its types, and the watch types `WatchHandle`, `NativeWatchHandle`, and `WatchEnd` with their implementations `Watch` and `NativeWatch`. | Node and browsers |
 | `@earendil-works/chord/node` | Child host processes: `createHostManager`, `forkDriver`, `childControl`, `processLock`; the facet module loader `nodeLoader`. | Node |
 | `@earendil-works/chord/context` | Explicit cancellation, telemetry, and invocation values: `BACKGROUND_CONTEXT`, `withCancel`, `withAbortSignal`, `withoutAbortSignal`, `withTelemetry`, `traceIn`, `withContextValue`, `awaitWithContext`. | Node and browsers |
 | `@earendil-works/chord/delta` | The transactional JSON tracker, structural diff, immutable apply, and the wire encoder/decoder for operation batches. | Node and browsers |
@@ -210,10 +210,12 @@ model; see [State](docs/guide.md#state) in the usage guide.
 Durable's documents, conversation views, and task graph. `watch.value` is the value
 at acquisition until `start(listener)` installs the sole asynchronous listener; each
 later change arrives as `(value, ops, context)`, one call at a time, and `value`
-advances to it. A source keeps at most 100 undelivered frames and then replaces them
-with one root replacement `[["r", newest]]`. `stop()` is idempotent, drops pending
-frames, and neither aborts nor awaits a running call; it and `closed` give the
-`WatchEnd`:
+advances to it. Changes made while the listener runs (or before `start`) arrive in
+one call: the newest value, the ops of all of them folded by Delta's `PendingOps`,
+and the newest change's context. Past 10,000 pending ops after folding the call
+gets one root replacement `[["r", newest]]` instead. `stop()` is idempotent, drops
+pending frames, and neither aborts nor awaits a running call; it and `closed` give
+the `WatchEnd`:
 
 - `stopped`: `stop()` was called;
 - `cancelled`: the context the watch was acquired with was cancelled;
@@ -224,3 +226,10 @@ frames, and neither aborts nor awaits a running call; it and `closed` give the
 
 An ended watch drops every reference into its source, so a stopped watch that is
 still referenced keeps only its last value alive.
+
+Sources implement handles with `Watch<T>`, fed through `advance(value, ops, context)`,
+`retire(context)`, `end()` or `end({ error })`, and `observeCancellation(signal)`.
+`NativeWatch<T>` implements `NativeWatchHandle<T>`, the same lifecycle for
+in-process values: the listener gets `(value, context)` without ops, one call per
+value in order; past 100 pending values they collapse to one, the value of the
+optional `replace()` or the newest.
