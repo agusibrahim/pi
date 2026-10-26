@@ -1,20 +1,17 @@
 diff --git a/packages/ai/CHANGELOG.md b/packages/ai/CHANGELOG.md
-index 74aa15c4d..559441fee 100644
+index 920d227e7..afe944204 100644
 --- a/packages/ai/CHANGELOG.md
 +++ b/packages/ai/CHANGELOG.md
-@@ -2,6 +2,10 @@
+@@ -10,6 +10,7 @@
  
- ## [Unreleased]
- 
-+### Added
-+
+ - Added optional `openBrowserOnConfirm` and `copyCodeOnConfirm` to `device_code` auth events and `OAuthDeviceCodeInfo`. Both default to `true`; set them to `false` to stop clients from offering to open the verification page or copy the code ([#9282](https://github.com/earendil-works/pi/issues/9282), [#9301](https://github.com/earendil-works/pi/pull/9301))
+ - Added `StreamingJsonParser`, an incremental, tolerant parser for JSON text that arrives in pieces (each piece is read once; snapshots of the partial value never change once returned), and `ToolCallArgumentsStream`, which every provider now uses for streamed tool-call arguments; its `append()` also returns the changes each piece made (`JsonChange`: a value set at a path, or text appended to a string), for writers that keep their own copy ([#9265](https://github.com/earendil-works/pi/issues/9265))
 +- Added Android AAS sign-in for the `google` provider. The Gemini Developer API accepts OAuth access tokens only as `Authorization: Bearer`, so `/login google` can now exchange a pasted Android AAS master token (`aas_et/...`) for an access token and renew it automatically, instead of requiring a Gemini API key
-+
- ### Fixed
  
- - Fixed Claude models that accept mid-conversation system messages rejecting a session with a 400 (`role 'system' must precede an 'assistant' message`) when a system update was followed by an assistant reply with nothing to send to Anthropic, such as an empty reply or another model's reasoning-only reply ([#11091](https://github.com/earendil-works/pi/issues/11091))
+ ### Changed
+ 
 diff --git a/packages/ai/src/api/google-generative-ai.ts b/packages/ai/src/api/google-generative-ai.ts
-index 5e44ce2a4..a9ac1d259 100644
+index 213eff5e8..fd80325f5 100644
 --- a/packages/ai/src/api/google-generative-ai.ts
 +++ b/packages/ai/src/api/google-generative-ai.ts
 @@ -9,7 +9,6 @@ import type {
@@ -38,7 +35,7 @@ index 5e44ce2a4..a9ac1d259 100644
  			let params = buildParams(model, normalizedContext, options);
  			const nextParams = await options?.onPayload?.(params, model);
  			if (nextParams !== undefined) {
-@@ -307,13 +302,11 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
+@@ -301,13 +296,11 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
  	context: TranscriptContext,
  	options?: SimpleStreamOptions,
  ): AssistantMessageEventStream => {
@@ -55,7 +52,7 @@ index 5e44ce2a4..a9ac1d259 100644
  		toolChoice: options?.toolChoice,
  	} satisfies GoogleOptions;
  	if (!options?.reasoning) {
-@@ -345,10 +338,53 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
+@@ -339,10 +332,53 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
  	} satisfies GoogleOptions);
  };
  
@@ -111,7 +108,7 @@ index 5e44ce2a4..a9ac1d259 100644
  	identity?: ClientIdentity,
  ): GoogleGenAI {
  	const httpOptions: { baseUrl?: string; apiVersion?: string; headers?: Record<string, string> } = {};
-@@ -356,11 +392,21 @@ function createClient(
+@@ -350,11 +386,21 @@ function createClient(
  		httpOptions.baseUrl = model.baseUrl;
  		httpOptions.apiVersion = ""; // baseUrl already includes version path, don't append
  	}
