@@ -1,4 +1,4 @@
-name: Build Patched (macOS)
+name: Build Patched
 
 # Builds pi from this fork with patches/google-aas.patch applied. The patch adds
 # Android AAS sign-in to the google provider; without it the fork is byte-for-byte
@@ -143,23 +143,30 @@ jobs:
       matrix:
         include:
           - label: darwin-arm64
+            family: darwin
             runner: macos-latest
             platform: darwin-arm64
-          # macOS-only for now so the run stays short. Uncomment a target to add it
-          # back; every entry needs a runner that can compile for `platform`.
+          - label: linux-x64
+            family: linux
+            runner: ubuntu-latest
+            platform: linux-x64
+          - label: linux-arm64
+            family: linux
+            runner: ubuntu-24.04-arm
+            platform: linux-arm64
+          # Uncomment a target to add it back; every entry needs a runner that
+          # compiles for `platform` natively, so Verify the binary can execute
+          # what it built, and needs `family` kept in sync with `platform`.
           # - label: darwin-x64
+          #   family: darwin
           #   runner: macos-13
           #   platform: darwin-x64
-          # - label: linux-x64
-          #   runner: ubuntu-latest
-          #   platform: linux-x64
-          # - label: linux-arm64
-          #   runner: ubuntu-24.04-arm
-          #   platform: linux-arm64
           # - label: windows-x64
+          #   family: windows
           #   runner: windows-latest
           #   platform: windows-x64
           # - label: windows-arm64
+          #   family: windows
           #   runner: windows-11-arm
           #   platform: windows-arm64
     steps:
@@ -276,6 +283,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: patched-${{ matrix.platform }}
+          FAMILY: ${{ matrix.family }}
         shell: bash
         run: |
           set -euo pipefail
@@ -293,11 +301,15 @@ jobs:
 
           The build fails if the compiled binary does not contain the Android AAS
           token exchange, so an asset here always carries the patch.
-
-          macOS Gatekeeper quarantines downloaded binaries:
-          \`xattr -dr com.apple.quarantine pi\` after extracting, then \`chmod +x pi\`.
           NOTES
           )"
+
+          # Platform-specific install hint, so the notes stay accurate per OS.
+          if [ "${FAMILY}" = darwin ]; then
+            notes+=$'\n\nmacOS Gatekeeper quarantines downloaded binaries:\n`xattr -dr com.apple.quarantine pi` after extracting, then `chmod +x pi`.'
+          else
+            notes+=$'\n\nThe tar archive keeps the executable bit; extract and run `./pi`.'
+          fi
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "updating existing release ${RELEASE_TAG}"
