@@ -142,9 +142,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # bun can cross-compile, so a target does not need a matching runner:
+          # all x64 hosts build every target. GitHub's macOS arm64 hosted runner
+          # pool is capacity-constrained (jobs sat 15 minutes without being
+          # acquired, then the queue gave up), so darwin builds on ubuntu too —
+          # upstream's own build-binaries.yml builds every platform on ubuntu.
+          # Each entry still needs `family` kept in sync with `platform`.
           - label: darwin-arm64
             family: darwin
-            runner: macos-latest
+            runner: ubuntu-latest
             platform: darwin-arm64
           - label: linux-x64
             family: linux
@@ -154,20 +160,17 @@ jobs:
             family: linux
             runner: ubuntu-24.04-arm
             platform: linux-arm64
-          # Uncomment a target to add it back; every entry needs a runner that
-          # compiles for `platform` natively, so Verify the binary can execute
-          # what it built, and needs `family` kept in sync with `platform`.
           # - label: darwin-x64
           #   family: darwin
-          #   runner: macos-13
+          #   runner: ubuntu-latest
           #   platform: darwin-x64
           # - label: windows-x64
           #   family: windows
-          #   runner: windows-latest
+          #   runner: ubuntu-latest
           #   platform: windows-x64
           # - label: windows-arm64
           #   family: windows
-          #   runner: windows-11-arm
+          #   runner: ubuntu-latest
           #   platform: windows-arm64
     steps:
       - name: Checkout
@@ -252,9 +255,22 @@ jobs:
           set -euo pipefail
 
           binary="${{ github.workspace }}/build-out/${{ matrix.platform }}/pi"
-          test -x "$binary" || { ls -R "${{ github.workspace }}/build-out"; exit 1; }
+          test -f "$binary" || { ls -R "${{ github.workspace }}/build-out"; exit 1; }
 
-          "$binary" --version
+          # Bun cross-compiles, so the target platform does not have to match the
+          # runner: darwin-arm64 and linux-x64 both build on ubuntu-latest. Only
+          # execute the binary when it can run here, and inspect it otherwise.
+          host_platform="$(node -p '"${process.platform}-${process.arch}"')"
+          if [ "${host_platform}" = "${{ matrix.platform }}" ]; then
+            chmod +x "$binary"
+            "$binary" --version
+          else
+            echo "cross-built for ${{ matrix.platform }} on ${host_platform}; checking statically"
+            case "${{ matrix.platform }}" in
+              darwin-*) file "$binary" | grep -q 'Mach-O' || { echo '::error::not a Mach-O binary'; exit 1; } ;;
+              linux-*) file "$binary" | grep -q 'ELF' || { echo '::error::not an ELF binary'; exit 1; } ;;
+            esac
+          fi
 
           # The compiled bundle must contain the AAS exchange, otherwise the build
           # silently produced an unpatched pi.
@@ -319,6 +335,23 @@ jobs:
             gh release create "${RELEASE_TAG}" --title "${RELEASE_TAG}" --notes "${notes}" --prerelease
           fi
 
-          gh release upload "${RELEASE_TAG}" "${archive}" --clobber
+          # GitHub's asset upload endpoint returns transient HTTP 500s; retries
+          # keep a 20-minute build from dying on the last step. The rolling
+          # release tags are per-platform, so concurrent matrix jobs never
+          # upload to the same tag.
+          upload_with_retries() {
+            local attempts=5 n=1
+            until gh release upload "${RELEASE_TAG}" "$1" --clobber; do
+              if [ "${n}" -ge "${attempts}" ]; then
+                echo "::error::gh release upload failed ${n} times: $1" >&2
+                return 1
+              fi
+              echo "upload failed (attempt ${n}/${attempts}); retrying in 10s" >&2
+              n=$((n + 1))
+              sleep 10
+            done
+          }
+
+          upload_with_retries "${archive}"
           printf '%s  %s\n' "${sha}" "$(basename "${archive}")" > "build-out/SHA256SUMS-${RELEASE_TAG}.txt"
-          gh release upload "${RELEASE_TAG}" "build-out/SHA256SUMS-${RELEASE_TAG}.txt" --clobber
+          upload_with_retries "build-out/SHA256SUMS-${RELEASE_TAG}.txt"
