@@ -176,6 +176,73 @@ describe("schemas", () => {
 		]);
 	});
 
+	// #11697
+	it("applies a relative root $id once when resolving local references", () => {
+		const schema = {
+			$id: "schemas/tool.json",
+			type: "object",
+			properties: { count: { $ref: "#/$defs/count" } },
+			required: ["count"],
+			$defs: { count: { type: "integer" } },
+		};
+		expect(compile(schema).check({ count: 2 })).toBe(true);
+		const validator = compile(schema, { unresolvedRefs: "reject" });
+		expect(validator.check({ count: 2 })).toBe(true);
+		expect(validator.errors({ count: "a" })).toEqual([
+			{ path: "/count", keyword: "type", message: "expected integer, got string" },
+		]);
+		expect(compile(schema, { coerce: true }).parse({ count: "2" })).toEqual({ ok: true, value: { count: 2 } });
+	});
+
+	it("applies a relative root $id once in schemas with unevaluated keywords", () => {
+		const props = {
+			$id: "schemas/tool.json",
+			type: "object",
+			properties: { count: { $ref: "#/$defs/count" } },
+			$defs: { count: { type: "integer" } },
+			unevaluatedProperties: false,
+		};
+		const validator = compile(props, { unresolvedRefs: "reject" });
+		expect(validator.check({ count: 2 })).toBe(true);
+		expect(validator.errors({ count: 2, extra: 1 })).toEqual([
+			{ path: "/extra", keyword: "unevaluatedProperties", message: "unknown field" },
+		]);
+		const items = {
+			$id: "schemas/list.json",
+			type: "array",
+			prefixItems: [{ $ref: "#/$defs/count" }],
+			$defs: { count: { type: "integer" } },
+			unevaluatedItems: false,
+		};
+		expect(compile(items, { unresolvedRefs: "reject" }).check([2])).toBe(true);
+		expect(compile(items).check([2, 3])).toBe(false);
+	});
+
+	it("explains errors under nested resources with a relative $id", () => {
+		const cloned = {
+			$id: "https://example.com/root.json",
+			allOf: [{ $ref: "#/$defs/child" }],
+			$defs: {
+				child: {
+					$id: "schemas/tool.json",
+					$ref: "#/$defs/props",
+					unevaluatedProperties: false,
+					$defs: { props: { properties: { count: { type: "integer" } } } },
+				},
+			},
+		};
+		expect(compile(cloned).errors({ count: 2, extra: 1 })).toEqual([
+			{ path: "/extra", keyword: "unevaluatedProperties", message: "unknown field" },
+		]);
+		const branch = {
+			$id: "https://example.com/root.json",
+			anyOf: [{ $id: "a/b.json", $ref: "#/$defs/n", $defs: { n: { type: "integer" } } }, { type: "boolean" }],
+		};
+		expect(compile(branch).errors({})).toEqual([
+			{ path: "", keyword: "type", message: "expected integer, got object" },
+		]);
+	});
+
 	it("throws for a malformed schema", () => {
 		expect(() => compile({ properties: { a: 1 } })).toThrow(/must be an object or a boolean/);
 	});
@@ -222,6 +289,60 @@ describe("unresolved references", () => {
 		expect(validator.errors({ a: { x: "1" } })).toEqual([
 			{ path: "/a", keyword: "$ref", message: "unresolved reference A" },
 		]);
+	});
+});
+
+describe("leaf checks inlined by object and array loops", () => {
+	const leaves: [object, unknown[]][] = [
+		[{ const: "a" }, ["a", "b", 1, null]],
+		[{ const: null }, [null, 0, false, "null"]],
+		[{ enum: ["a", 1, null] }, ["a", 1, null, "b", 2, true]],
+		[{ type: ["string", "null"] }, ["a", null, 1, {}, []]],
+		[{ type: ["integer", "boolean"] }, [1, 1.5, true, "1"]],
+		[{ type: ["number", "array"] }, [1.5, 2, [], {}, new Uint8Array(1)]],
+		[{ type: ["object", "bytes"] }, [{}, new Uint8Array(1), [], null]],
+		[{ anyOf: [{ type: "string" }, { type: "null" }] }, ["a", null, 1]],
+		[{ anyOf: [{ type: "integer" }, { type: "string", minLength: 2 }] }, [1, 1.5, "ab", "a"]],
+		[{ type: "integer", minimum: 1, exclusiveMaximum: 5 }, [1, 4, 5, 0, 2.5, "2"]],
+		[{ type: "number", exclusiveMinimum: 0, maximum: 1 }, [0.5, 1, 0, 1.5, "0.5"]],
+		[{ type: "integer", multipleOf: 2 }, [2, 3, 2.5]],
+		[{ type: "string", minLength: 2, maxLength: 3 }, ["ab", "abc", "a", "abcd", "😀😀", 12]],
+		[{ type: "string", pattern: "^a+$" }, ["aa", "ab", 1]],
+		[{ minimum: 1 }, [1, 0, "x", null]],
+	];
+
+	it("agree with the standalone check as a property, a pattern property and an item", () => {
+		for (const [schema, values] of leaves) {
+			const alone = compile(schema).check;
+			const closed = compile({ type: "object", properties: { p: schema }, additionalProperties: false }).check;
+			const open = compile({ type: "object", properties: { p: schema }, required: ["q"] }).check;
+			const items = compile({ type: "array", items: schema }).check;
+			for (const v of values) {
+				const expected = alone(v);
+				expect([closed({ p: v }), open({ p: v, q: 1 }), items([v])], JSON.stringify({ schema, v })).toEqual([
+					expected,
+					expected,
+					expected,
+				]);
+			}
+		}
+	});
+
+	it("find properties in any order", () => {
+		const { check } = compile({
+			type: "object",
+			properties: { a: { const: 1 }, b: { type: "string" }, c: { type: "integer", minimum: 0 } },
+			required: ["a", "c"],
+			additionalProperties: false,
+		});
+		expect(check({ a: 1, b: "x", c: 0 })).toBe(true);
+		expect(check({ c: 0, b: "x", a: 1 })).toBe(true);
+		expect(check({ b: "x", c: 0, a: 1 })).toBe(true);
+		expect(check({ a: 1, c: 0, a2: 1 })).toBe(false);
+		expect(check({ c: -1, a: 1 })).toBe(false);
+		expect(check({ c: 0, b: 1, a: 1 })).toBe(false);
+		expect(check({ c: 0, b: undefined, a: 1 })).toBe(true);
+		expect(check({ c: 0, b: "x" })).toBe(false);
 	});
 });
 
