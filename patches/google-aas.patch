@@ -1,15 +1,3 @@
-diff --git a/packages/ai/CHANGELOG.md b/packages/ai/CHANGELOG.md
-index 920d227e7..afe944204 100644
---- a/packages/ai/CHANGELOG.md
-+++ b/packages/ai/CHANGELOG.md
-@@ -10,6 +10,7 @@
- 
- - Added optional `openBrowserOnConfirm` and `copyCodeOnConfirm` to `device_code` auth events and `OAuthDeviceCodeInfo`. Both default to `true`; set them to `false` to stop clients from offering to open the verification page or copy the code ([#9282](https://github.com/earendil-works/pi/issues/9282), [#9301](https://github.com/earendil-works/pi/pull/9301))
- - Added `StreamingJsonParser`, an incremental, tolerant parser for JSON text that arrives in pieces (each piece is read once; snapshots of the partial value never change once returned), and `ToolCallArgumentsStream`, which every provider now uses for streamed tool-call arguments; its `append()` also returns the changes each piece made (`JsonChange`: a value set at a path, or text appended to a string), for writers that keep their own copy ([#9265](https://github.com/earendil-works/pi/issues/9265))
-+- Added Android AAS sign-in for the `google` provider. The Gemini Developer API accepts OAuth access tokens only as `Authorization: Bearer`, so `/login google` can now exchange a pasted Android AAS master token (`aas_et/...`) for an access token and renew it automatically, instead of requiring a Gemini API key
- 
- ### Changed
- 
 diff --git a/packages/ai/src/api/google-generative-ai.ts b/packages/ai/src/api/google-generative-ai.ts
 index 213eff5e8..fd80325f5 100644
 --- a/packages/ai/src/api/google-generative-ai.ts
@@ -366,10 +354,10 @@ index 000000000..2fc292df3
 +	},
 +};
 diff --git a/packages/ai/src/auth/oauth/load.ts b/packages/ai/src/auth/oauth/load.ts
-index 839fe3152..5121da78b 100644
+index be63e8acf..3c014b090 100644
 --- a/packages/ai/src/auth/oauth/load.ts
 +++ b/packages/ai/src/auth/oauth/load.ts
-@@ -18,6 +18,7 @@ type OAuthFlowLoaders = {
+@@ -21,6 +21,7 @@ type OAuthFlowLoaders = {
  	githubCopilot: () => OAuthAuth | Promise<OAuthAuth>;
  	openrouter: () => OAuthAuth | Promise<OAuthAuth>;
  	kimiCoding: () => OAuthAuth | Promise<OAuthAuth>;
@@ -377,7 +365,7 @@ index 839fe3152..5121da78b 100644
  	meta: () => OAuthAuth | Promise<OAuthAuth>;
  	xai: () => OAuthAuth | Promise<OAuthAuth>;
  	radius: (options: { name: string; gateway: string }) => OAuthAuth | Promise<OAuthAuth>;
-@@ -60,6 +61,11 @@ export const loadKimiCodingOAuth = async (): Promise<OAuthAuth> => {
+@@ -63,6 +64,11 @@ export const loadKimiCodingOAuth = async (): Promise<OAuthAuth> => {
  	return ((await importOAuthModule("./kimi-coding.ts")) as { kimiCodingOAuth: OAuthAuth }).kimiCodingOAuth;
  };
  
