@@ -18,6 +18,18 @@ on:
     - cron: '17 5 * * 1'
   workflow_dispatch:
     inputs:
+      linux:
+        description: 'Build Linux binaries (linux-x64, linux-arm64)'
+        type: boolean
+        default: true
+      mac:
+        description: 'Build macOS binaries (darwin-arm64, darwin-x64)'
+        type: boolean
+        default: true
+      windows:
+        description: 'Build Windows binaries (windows-x64, windows-arm64)'
+        type: boolean
+        default: false
       sync:
         description: 'Merge upstream main into this branch before building'
         type: boolean
@@ -35,6 +47,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  select_platforms:
+    name: Select target platforms
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Compute platform matrix
+        id: set-matrix
+        run: |
+          set -euo pipefail
+          node -e '
+            const event = process.env.EVENT_NAME;
+            const wantLinux = event === "workflow_dispatch" ? process.env.INPUT_LINUX === "true" : true;
+            const wantMac = event === "workflow_dispatch" ? process.env.INPUT_MAC === "true" : true;
+            const wantWindows = event === "workflow_dispatch" ? process.env.INPUT_WINDOWS === "true" : false;
+
+            const items = [];
+            if (wantMac) {
+              items.push({ label: "darwin-arm64", family: "darwin", runner: "ubuntu-latest", platform: "darwin-arm64" });
+              if (event === "workflow_dispatch") {
+                items.push({ label: "darwin-x64", family: "darwin", runner: "ubuntu-latest", platform: "darwin-x64" });
+              }
+            }
+            if (wantLinux) {
+              items.push({ label: "linux-x64", family: "linux", runner: "ubuntu-latest", platform: "linux-x64" });
+              items.push({ label: "linux-arm64", family: "linux", runner: "ubuntu-24.04-arm", platform: "linux-arm64" });
+            }
+            if (wantWindows) {
+              items.push({ label: "windows-x64", family: "windows", runner: "ubuntu-latest", platform: "windows-x64" });
+              items.push({ label: "windows-arm64", family: "windows", runner: "ubuntu-latest", platform: "windows-arm64" });
+            }
+
+            if (items.length === 0) {
+              console.error("::error::Select at least one platform (linux, mac, or windows)");
+              process.exit(1);
+            }
+            const fs = require("node:fs");
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(items)}\n`);
+            console.log("Selected platforms:", items.map((i) => i.platform).join(", "));
+          '
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_LINUX: ${{ inputs.linux }}
+          INPUT_MAC: ${{ inputs.mac }}
+          INPUT_WINDOWS: ${{ inputs.windows }}
+
   # Runs only on schedule and on a manual dispatch that asked for it. Merges
   # upstream so the fork tracks pi, then pushes with [skip ci] so the push does
   # not also fire the matrix below; this run does the build instead.
@@ -131,9 +189,9 @@ jobs:
 
   build:
     name: ${{ matrix.label }}
-    needs: sync_upstream
+    needs: [select_platforms, sync_upstream]
     # `needs` with a skipped job would skip this too, so opt back in explicitly.
-    if: ${{ !cancelled() && needs.sync_upstream.result != 'failure' }}
+    if: ${{ !cancelled() && needs.select_platforms.result == 'success' && needs.sync_upstream.result != 'failure' }}
     runs-on: ${{ matrix.runner }}
     # contents: write is only needed to publish the rolling GitHub Release.
     permissions:
@@ -141,37 +199,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # bun can cross-compile, so a target does not need a matching runner:
-          # all x64 hosts build every target. GitHub's macOS arm64 hosted runner
-          # pool is capacity-constrained (jobs sat 15 minutes without being
-          # acquired, then the queue gave up), so darwin builds on ubuntu too —
-          # upstream's own build-binaries.yml builds every platform on ubuntu.
-          # Each entry still needs `family` kept in sync with `platform`.
-          - label: darwin-arm64
-            family: darwin
-            runner: ubuntu-latest
-            platform: darwin-arm64
-          - label: linux-x64
-            family: linux
-            runner: ubuntu-latest
-            platform: linux-x64
-          - label: linux-arm64
-            family: linux
-            runner: ubuntu-24.04-arm
-            platform: linux-arm64
-          # - label: darwin-x64
-          #   family: darwin
-          #   runner: ubuntu-latest
-          #   platform: darwin-x64
-          # - label: windows-x64
-          #   family: windows
-          #   runner: ubuntu-latest
-          #   platform: windows-x64
-          # - label: windows-arm64
-          #   family: windows
-          #   runner: ubuntu-latest
-          #   platform: windows-arm64
+        include: ${{ fromJson(needs.select_platforms.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -255,11 +283,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          binary="${{ github.workspace }}/build-out/${{ matrix.platform }}/pi"
+          if [ "${{ matrix.family }}" = "windows" ]; then
+            binary="${{ github.workspace }}/build-out/${{ matrix.platform }}/pi.exe"
+          else
+            binary="${{ github.workspace }}/build-out/${{ matrix.platform }}/pi"
+          fi
           test -f "$binary" || { ls -R "${{ github.workspace }}/build-out"; exit 1; }
 
           # Bun cross-compiles, so the target platform does not have to match the
-          # runner: darwin-arm64 and linux-x64 both build on ubuntu-latest. Only
+          # runner: darwin, windows, and linux-x64 all build on ubuntu-latest. Only
           # execute the binary when it can run here, and inspect it otherwise.
           host_platform="$(node -p '"${process.platform}-${process.arch}"')"
           if [ "${host_platform}" = "${{ matrix.platform }}" ]; then
@@ -270,6 +302,7 @@ jobs:
             case "${{ matrix.platform }}" in
               darwin-*) file "$binary" | grep -q 'Mach-O' || { echo '::error::not a Mach-O binary'; exit 1; } ;;
               linux-*) file "$binary" | grep -q 'ELF' || { echo '::error::not an ELF binary'; exit 1; } ;;
+              windows-*) file "$binary" | grep -q 'PE32+' || { echo '::error::not a PE32+ binary'; exit 1; } ;;
             esac
           fi
 
@@ -285,8 +318,8 @@ jobs:
         with:
           name: pi-patched-${{ matrix.platform }}
           path: |
-            build-out/${{ matrix.platform }}/pi
-            build-out/pi-${{ matrix.platform }}.tar.gz
+            build-out/${{ matrix.platform }}/pi*
+            build-out/pi-${{ matrix.platform }}.*
           if-no-files-found: error
           retention-days: 30
 
@@ -305,7 +338,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          archive="build-out/pi-${{ matrix.platform }}.tar.gz"
+          if [ "${FAMILY}" = "windows" ]; then
+            archive="build-out/pi-${{ matrix.platform }}.zip"
+          else
+            archive="build-out/pi-${{ matrix.platform }}.tar.gz"
+          fi
           sha="$(sha256sum "${archive}" | cut -d' ' -f1)"
 
           notes="$(cat <<NOTES
@@ -324,6 +361,8 @@ jobs:
           # Platform-specific install hint, so the notes stay accurate per OS.
           if [ "${FAMILY}" = darwin ]; then
             notes+=$'\n\nmacOS Gatekeeper quarantines downloaded binaries:\n`xattr -dr com.apple.quarantine pi` after extracting, then `chmod +x pi`.'
+          elif [ "${FAMILY}" = windows ]; then
+            notes+=$'\n\nExtract the zip archive and run `pi.exe`.'
           else
             notes+=$'\n\nThe tar archive keeps the executable bit; extract and run `./pi`.'
           fi
