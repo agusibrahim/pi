@@ -138,7 +138,19 @@ jobs:
           # terminate this YAML block scalar.
           merge_message="$(printf 'chore: merge upstream main into fork\n\n[skip ci]\n')"
 
-          if ! git merge --no-ff --no-edit -m "${merge_message}" "${upstream_sha}"; then
+          # Merge without committing so any conflict inside .github/workflows/ can
+          # be resolved automatically by restoring the fork's own workflows directory
+          # (which GITHUB_TOKEN is not allowed to modify anyway).
+          git merge --no-commit --no-ff "${upstream_sha}" || true
+
+          rm -rf .github/workflows
+          git rm -rf -q --cached --ignore-unmatch .github/workflows
+          git checkout HEAD -- .github/workflows
+
+          unmerged="$(git diff --name-only --diff-filter=U)"
+          if [ -n "${unmerged}" ]; then
+            echo "Unmerged files outside .github/workflows:" >&2
+            echo "${unmerged}" >&2
             git merge --abort || true
             printf '%s\n' \
               '' \
@@ -154,29 +166,9 @@ jobs:
             exit 1
           fi
 
-          # GitHub refuses a GITHUB_TOKEN push that modifies anything under
-          # .github/workflows/, and no `permissions:` scope lifts that. The
-          # merge brings upstream's own CI files along, so put the fork's
-          # versions back before pushing: this fork does not run upstream's CI
-          # (ci.yml is disabled), it only needs upstream's source.
-          if git diff --quiet HEAD^1 HEAD -- .github/workflows; then
-            echo "upstream did not touch .github/workflows"
-          else
-            echo "keeping the fork's .github/workflows (upstream CI files are unused here)"
-            git checkout HEAD^1 -- .github/workflows
-            # `git checkout <tree> -- <path>` only updates paths the tree has, so
-            # workflow files upstream added stay in the index. Drop them, or the
-            # push still creates a workflow file and gets rejected.
-            git diff --cached --name-only --diff-filter=A HEAD^1 -- .github/workflows |
-              while read -r added; do
-                [ -n "${added}" ] && git rm -q --cached --ignore-unmatch -- "${added}"
-              done
-            git commit --amend --no-edit
-            # The checkout drops upstream-only workflow files from the index,
-            # so the commit's tree no longer differs from HEAD^1 here.
-            git diff --quiet HEAD^1 HEAD -- .github/workflows ||
-              { echo '::error::could not restore .github/workflows'; exit 1; }
-          fi
+          git commit --no-edit -m "${merge_message}"
+          git diff --quiet HEAD^1 HEAD -- .github/workflows ||
+            { echo '::error::could not restore .github/workflows'; exit 1; }
 
           git push origin HEAD:main
           echo "sync_status=merged" >> "${GITHUB_ENV}"
@@ -204,6 +196,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
 
