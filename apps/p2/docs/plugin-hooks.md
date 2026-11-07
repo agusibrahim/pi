@@ -189,7 +189,7 @@ that must survive reload reads live resources through getters (`plugins/codemode
 | `HarnessEnvironments` | registry, key `"remote"` only | opens a remote machine (`at(cwd)` environments, one connection) per environment name | `src/runtime/worker.ts` | envs |
 | `ConversationLocations` | local, one provider | conversations following the session, own locations (`place`, `own`) | `src/runtime/worker.ts` | subagents (`plugins/subagents/worker.ts`) |
 | `Harness` | local, lifetime "host" | `harness` (native Durable Harness), `environments` (`session`, `locate(id)`, `at(location)`) | `src/runtime/worker.ts` | most worker plugins |
-| `WorkerProcess` | local, lifetime "host" | `init` (dataDir, generation, `values` from `WorkerInitValues`), `liveness` (`add("viewers" \| "activeCalls")`, `stopping`) | `src/runtime/worker.ts:165` | chat and workspace (viewers), codemode (`stopping`) |
+| `WorkerProcess` | local, lifetime "host" | `init` (dataDir, generation, `values` from `WorkerInitValues`), `liveness` (`add("viewers" \| "activeCalls")`, `stopping`) | `src/runtime/worker.ts` | workspace (viewers), participants' calls (`activeCalls`, the relocation fence), codemode (`stopping`) |
 | `Conversation` | local (chat) | `submit` (input with own `entry` kind), `write` (display-only entry), `stop`, `history`, `compact`, `reset`, `runShell`… | `plugins/chat/contract.ts:140-189` | chat-mode, conversations |
 
 ```ts
@@ -314,8 +314,8 @@ Prompt registers templates and skills (`plugins/prompt/tui.ts:87`).
 
 | Registry | Key → value | Order | Users |
 | --- | --- | --- | --- |
-| `TuiToolRenderers` | tool name → pi `ToolRenderers` (`renderCall`, `renderResult`, `renderShell`; `src/tui/tools/types.ts:15-62`) | overrides built-ins | artifacts, ports, send-file, subagents |
-| `TuiToolRendererResolvers` | `<order>:<plugin>` → `(toolName, next) => renderers` | key order, then the registry, then built-ins (`src/tui/tools/index.ts:20-28`) | quiet-tools (`10:`: one line per call, full content when expanded or failed) |
+| `TuiToolRenderers` | tool name → pi `ToolRenderers` (`renderCall`, `renderResult`, `renderShell`, p2's `nestedCalls`; `src/tui/tools/types.ts`) | — (without one: pi's generic card) | coding-tools, powershell, codemode, artifacts, ports, send-file, subagents, history |
+| `TuiToolRendererResolvers` | `<order>:<plugin>` → `(toolName, next) => renderers` | key order, then the registry (`src/tui/tools/index.ts`); the registry's `nestedCalls` stays | quiet-tools (`10:`: one line per call, full content when expanded or failed) |
 | `TuiSettingFields` | `<plugin>.<name>` → `/settings` row (label, values, fallback), stored at `settings.plugins.<plugin>.<name>` of the visitor's prefs; read with `pluginSetting`; resolvers get the settings, a change redraws every card (`src/runtime/tui-preferences.ts`) | after the built-in rows, key order | quiet-tools |
 | `TuiEntryRenderers` | entry kind → `(entry, ctx) => Component \| undefined` (replaces the display; `undefined` hides) | — | core `p2.shell` (`src/tui/core-commands.ts:290`) |
 | `TuiMarkdownTransformers` | `<order>:<plugin>` → pi `MarkdownTransformer` | key order | core `00:mermaid` |

@@ -390,6 +390,22 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // AgentSession Class
 // ============================================================================
 
+/**
+ * Index of the model to cycle to, or undefined when there is nothing to switch to.
+ * When the current model is not in the list (currentIndex -1), forward picks the first
+ * entry and backward the last, so a one-entry list still selects its only model.
+ */
+function getNextCycleIndex(
+	currentIndex: number,
+	length: number,
+	direction: "forward" | "backward",
+): number | undefined {
+	if (length === 0) return undefined;
+	if (currentIndex === -1) return direction === "forward" ? 0 : length - 1;
+	if (length === 1) return undefined;
+	return direction === "forward" ? (currentIndex + 1) % length : (currentIndex - 1 + length) % length;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -638,22 +654,47 @@ export class AgentSession {
 		return model?.provider === message.provider && model.id === message.model ? model : undefined;
 	}
 
-	/**
-	 * Record the selection on the current branch when the branch implies another one, so a resume
-	 * restores it. Tree navigation can leave the latest `model_change` on another branch; responses
-	 * cannot record a virtual selection because they name physical models. Responses do record a
-	 * physical selection unless the branch holds a virtual one; checking a physical selection against
-	 * responses would record it on every prompt while `prepareRequest` redirects to another model.
-	 */
+	/** Record the live model and thinking level on the current branch, so a resume restores them. */
 	private _recordSelection(): void {
+		const branch = this.sessionManager.getBranch();
+		this._recordModelSelection(branch);
+		this._recordThinkingLevel(branch);
+	}
+
+	/**
+	 * Record the model on the current branch when the branch implies another one. Tree navigation
+	 * can leave the latest `model_change` on another branch; responses cannot record a virtual
+	 * selection because they name physical models. Responses do record a physical selection unless
+	 * the branch holds a virtual one; checking a physical selection against responses would record
+	 * it on every prompt while `prepareRequest` redirects to another model.
+	 */
+	private _recordModelSelection(branch: SessionEntry[]): void {
 		const model = this.model;
 		if (!model) return;
 		const getModel = (provider: string, modelId: string) => this._modelRuntime.getModel(provider, modelId);
-		const recorded = getBranchSelection(this.sessionManager.getBranch(), getModel);
+		const recorded = getBranchSelection(branch, getModel);
 		if (!recorded || (recorded.provider === model.provider && recorded.modelId === model.id)) return;
 		const recordedModel = getModel(recorded.provider, recorded.modelId);
 		if (!isVirtualModel(model) && !(recordedModel && isVirtualModel(recordedModel))) return;
 		this.sessionManager.appendModelChange(model.provider, model.id);
+	}
+
+	/**
+	 * Record the thinking level on the current branch when the branch implies another one (#11451).
+	 * Tree navigation can leave the latest `thinking_level_change` on another branch. The recorded
+	 * level is compared after clamping to the current model, so a level clamped on resume (e.g.
+	 * `xhigh` running as `high`) is not recorded over the requested one.
+	 */
+	private _recordThinkingLevel(branch: SessionEntry[]): void {
+		const recorded = branch.findLast((entry) => entry.type === "thinking_level_change");
+		if (!recorded) return;
+		const recordedLevel = recorded.thinkingLevel as ThinkingLevel;
+		const availableLevels = this.getAvailableThinkingLevels();
+		const effective = availableLevels.includes(recordedLevel)
+			? recordedLevel
+			: this._clampThinkingLevel(recordedLevel, availableLevels);
+		if (effective === this.thinkingLevel) return;
+		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
 	}
 
 	/** The model whose limits apply to the conversation. */
@@ -2662,14 +2703,10 @@ export class AgentSession {
 		const scopedModels = this._scopedModels.filter((scoped) =>
 			availableIds.has(`${scoped.model.provider}\0${scoped.model.id}`),
 		);
-		if (scopedModels.length <= 1) return undefined;
-
 		const currentModel = this.model;
-		let currentIndex = scopedModels.findIndex((sm) => modelsAreEqual(sm.model, currentModel));
-
-		if (currentIndex === -1) currentIndex = 0;
-		const len = scopedModels.length;
-		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
+		const currentIndex = scopedModels.findIndex((sm) => modelsAreEqual(sm.model, currentModel));
+		const nextIndex = getNextCycleIndex(currentIndex, scopedModels.length, direction);
+		if (nextIndex === undefined) return undefined;
 		const next = scopedModels[nextIndex];
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.model, next.thinkingLevel);
 
@@ -2698,14 +2735,10 @@ export class AgentSession {
 		options: ModelMutationOptions,
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = this._modelRuntime.getAvailableSnapshot();
-		if (availableModels.length <= 1) return undefined;
-
 		const currentModel = this.model;
-		let currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));
-
-		if (currentIndex === -1) currentIndex = 0;
-		const len = availableModels.length;
-		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
+		const currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));
+		const nextIndex = getNextCycleIndex(currentIndex, availableModels.length, direction);
+		if (nextIndex === undefined) return undefined;
 		const nextModel = availableModels[nextIndex];
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);

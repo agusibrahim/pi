@@ -1,8 +1,5 @@
 import { useRef, useState } from "react";
-import { Access, grantMode } from "../runtime/access.ts";
-
-import { liveIn } from "../runtime/refs.ts";
-import { closeLayers, Slot, useDrawer, useObject, useReadable, useRoute, useStatus } from "../runtime/web.tsx";
+import { closeLayers, Slot, useCanWrite, useDrawer, useRoute, useUnshownLayers } from "../runtime/web.tsx";
 import { useComposerState } from "./composer-state.tsx";
 import { useDrawerSwipe } from "./drawer-swipe.ts";
 import { OwnerNotices } from "./OwnerNotices.tsx";
@@ -12,14 +9,12 @@ export function AppLayout() {
 	const drawer = useDrawer(),
 		route = useRoute(),
 		collapsed = useSidebarCollapsed();
-	const access = useObject(Access, {}),
-		guest = useReadable(liveIn(access, "guest")?.grant);
-	const canWrite =
-		(useStatus(access) === "live" && access?.variant === "owner") || grantMode(guest, route.session) === "full";
+	const canWrite = useCanWrite(route.session);
 	const { addFiles } = useComposerState();
 	const [draggingFiles, setDraggingFiles] = useState(false);
 	const dragDepth = useRef(0);
 	const swipe = useDrawerSwipe();
+	useUnshownLayers();
 	return (
 		<div className={`app ${drawer ? "drawer-open" : ""} ${collapsed ? "sidebar-collapsed" : ""}`}>
 			<aside className="drawer" ref={swipe.drawer}>

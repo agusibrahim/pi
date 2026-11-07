@@ -343,6 +343,10 @@ Adaptations:
   (`Subagents`) rather than by forks.
 - **Named filter.** pi's named filter becomes a "pinned" filter (`pinned` exists).
 - **Delete.** Delete means archive, with restore available in the archived scope.
+- **Activity marker.** Each row starts with the web drawer's dot (`SessionStatus`, `SessionReads`): `●` working
+  (a subagent row: its conversation), `!` a failed worker, `◦` an unread answer (owner), else blank. The column
+  is two cells wide on every row, so titles stay put when a session starts or stops. As on the web, the chat showing
+  a session's main conversation marks it read through its latest answer (`SessionReads.markRead`).
 
 Adding regex/phrase search would be a `Search` contract change (d).
 
@@ -355,7 +359,7 @@ Adding regex/phrase search would be a `Search` contract change (d).
 | Launcher (terminal, connection, sign-in, grants, consent UI, modes, output filter) | `P2/src/hosts/tui.ts`, `tui-client.ts`, `tui-config.ts`, `tui-grants.ts`, `tui-actions.ts`, `tui-trusted-ui.ts`, `tui-modes.ts`, `tui-filter.ts`, `tui-local-preferences.ts` |
 | Bundle and sandbox | `P2/src/hosts/tui-bundle.ts`, `tui-sandbox.ts`, `tui-bootstrap.mjs`, `tui-worker-runtime.ts` |
 | Runtime (screens, overlays, commands, renderer registries, context) | `P2/src/runtime/tui.ts`, `tui-commands.ts`, `tui-renderers.ts`, `tui-context.ts`, `tui-preferences.ts` |
-| Copied components | `P2/src/tui/components/` (messages, transcript, tool card, status indicators and editor, selectors, header/footer/status lines), `P2/src/tui/tools/` (tool renderers), `P2/src/tui/theme/` |
+| Copied components | `P2/src/tui/components/` (messages, transcript, tool card, status indicators and editor, selectors, header/footer/status lines), `P2/src/tui/tools/` (renderer contract, helpers, the shared shell card; the tools' own renderers moved to their plugins' TUI facets), `P2/src/tui/theme/` |
 | Runtime commands, keybindings, reload snapshot | `P2/src/tui/core-commands.ts`, `keybindings.ts`, `snapshot.ts` |
 | Chat surface: transcript `ScrollView` over the dock, pending area, working indicator, sends | `P2/plugins/chat/tui.ts` (`ChatSurface`), `tui-commands.ts` |
 | Plugin screens and cards | `P2/plugins/<name>/tui.ts` |
@@ -1159,7 +1163,7 @@ Requests are debounced (~80 ms), aborted when superseded, and inserted as `@path
 | Shell, navigation, drawer | `P2/plugins/web-shell/web.tsx`, `P2/src/web/AppLayout.tsx`, `P2/src/web/navigation.ts` | Screens + overlays; Ctrl+R and `/resume` instead of a sidebar |
 | Sessions grouped by env:cwd, pinned, busy, children | `P2/src/web/Drawer.tsx` | Session selector (1.9, 1.17) |
 | New session (env + directory browser, model, first prompt) | `P2/src/web/new-session.tsx`, `P2/plugins/envs/DirectoryPicker.tsx` | `/new` overlay (`Envs.envs`, `Envs.listDirectory`) |
-| Session options (rename, pin, archive/restore, relocate) | `P2/plugins/sessions/SessionOptions.tsx` | `/name`, `sessions.pin`, `sessions.archive`, `sessions.relocate` |
+| Session options (rename, pin, archive/restore, relocate) | `P2/plugins/sessions/web.tsx` (Session sheet) | `/name`, `sessions.pin`, `sessions.archive`, `sessions.relocate` |
 | Search, archived | `P2/plugins/search`, `P2/src/web/Drawer.tsx` | Session selector (1.17) |
 | Transcript, tool cards | `P2/src/web/Chat.tsx`, `P2/src/web/Markdown.tsx`, `P2/src/web/Code.tsx` | 1.3, 1.4 |
 | Composer (steer/follow-up, stop, queue edit, attachments, drag/drop) | `P2/plugins/chat/web.tsx:83-200`, `P2/src/web/composer-state.tsx` | Editor, pending area, attachments via **L:pasteImage/attach** shown as chips in a `composer:attachments` widget |
@@ -1571,8 +1575,8 @@ Tests: `P2/test/p2/shell.test.ts` (a bare session host with real Durable and a r
   - One command at a time; Escape cancels.
 - **Contract.**
   - `Chat` is version 4 (versions 2 and 3 are accepted as they are).
-  - Participants get `shell({command, includeInContext, requestId})` → `{shellId}` and `abortShell({shellId})` →
-    `{aborted}`.
+  - Participants get `shell({command, includeInContext, requestId})` → `{shellId}` (the `requestId`, so a TUI shows
+    the command's block under its final ID before the state arrives) and `abortShell({shellId})` → `{aborted}`.
   - Both variants get the state `liveShell` (a state member cannot share the method's name):
     `{id, command, author, includeInContext, output, truncated, running, exitCode?, cancelled, error?} | null`.
   - **Who may:** anyone who may send, so full guests too, as tools run commands for them. Viewers watch.
@@ -1580,21 +1584,24 @@ Tests: `P2/test/p2/shell.test.ts` (a bare session host with real Durable and a r
   - **Cancelling:** the command's author or the owner.
   - **One at a time per conversation;** a second command is refused with pi's text (`SHELL_BUSY`).
   - **Retries:** a call with the same request ID runs once.
-- **Worker** (`P2/plugins/chat/worker.ts`; the shared `Conversation` object runs it, `runShell`/`abortShell`):
+- **Worker** (`P2/plugins/chat/shell.ts`; the worker's `ShellCommands` object, which `Chat` holds):
+  - A command is a Chord job (`p2.shell-commands.run`): `Chat.shell` returns once the run is started (committed with
+    the request ID it dedupes, among the last 100 starts per author), so `liveShell` shows it when the call answers.
   - The command runs on the conversation's environment, `Harness.environments.at(agent.cwd)`: local or remote, and
     a subagent's own cwd.
   - It uses the bash tool's settings (`inheritEnv`, spill and an output window at Durable's 2000 lines / 50 KiB,
     sampled every 200 ms at 100 KiB/s).
-  - The kept tail is published as `liveShell`.
-  - It runs as one active call (`Liveness.call`), so the worker stays up, and a move or clone waits for it. It runs
-    under its own root context (the method returns at once). Closing the object cancels it.
+  - The kept tail is the run's state document, which `liveShell` shows.
+  - A running job keeps the worker up (`host.activity.jobs`) and counts as one active call (`Liveness`, from before
+    its start until its run ends), so a move or a clone waits for it. `abortShell` aborts the run and answers once
+    `liveShell` shows it cancelled. A reload of the chat plugin or the worker's end aborts it.
   - When it ends, a Durable write submission places a `p2.shell` entry (`P2/src/runtime/shell.ts`, `ShellData`:
     author, command, output tail, `exitCode`, `cancelled`, `truncated`, `fullOutputPath`, `includeInContext`, `error`).
   - **`!`:** the entry also carries a user message (the sender block plus pi's `bashExecutionToText`,
     `shellContextText`). The agent reads it on its next run, and no run starts now.
   - **`!!`:** the entry is display-only.
-  - **Busy agent:** while the agent runs, the entry is placed at the run's next boundary, like any write.
-    `liveShell` clears once it is placed.
+  - **Busy agent:** while the agent runs, the entry is placed at the run's next boundary, like any write. The run
+    waits for the placement, so `liveShell` clears once the entry shows.
   - The data has no `text` field, so no reader takes it for a person's message.
   - **Deviation:** a command is not refused during a compaction; the write's placement keeps the order.
 - **TUI** (`P2/plugins/chat/tui.ts`):
