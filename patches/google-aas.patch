@@ -396,6 +396,18 @@ index 5e77cf1b6..69ce3901c 100644
  		meta: () => metaOAuth,
  		xai: () => xaiOAuth,
  		radius: createRadiusOAuth,
+diff --git a/packages/ai/src/lazy-oauth.ts b/packages/ai/src/lazy-oauth.ts
+index e05bd3bc2..2087c9720 100644
+--- a/packages/ai/src/lazy-oauth.ts
++++ b/packages/ai/src/lazy-oauth.ts
+@@ -16,6 +16,7 @@ export function registerLazyOAuthFlows(): void {
+ 		githubCopilot: async () => (await import("./auth/oauth/github-copilot.ts")).githubCopilotOAuth,
+ 		openrouter: async () => (await import("./auth/oauth/openrouter.ts")).openRouterOAuth,
+ 		kimiCoding: async () => (await import("./auth/oauth/kimi-coding.ts")).kimiCodingOAuth,
++		google: async () => (await import("./auth/oauth/google.ts")).googleOAuth,
+ 		meta: async () => (await import("./auth/oauth/meta.ts")).metaOAuth,
+ 		xai: async () => (await import("./auth/oauth/xai.ts")).xaiOAuth,
+ 		radius: async (options) => (await import("./auth/oauth/radius.ts")).createRadiusOAuth(options),
 diff --git a/packages/ai/src/providers/google.ts b/packages/ai/src/providers/google.ts
 index 0bd452373..c9e17240c 100644
 --- a/packages/ai/src/providers/google.ts
