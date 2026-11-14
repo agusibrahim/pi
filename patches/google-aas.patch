@@ -1,29 +1,29 @@
 diff --git a/packages/ai/src/api/google-generative-ai.ts b/packages/ai/src/api/google-generative-ai.ts
-index 213eff5e8..fd80325f5 100644
+index 9a39bddd3..89070122c 100644
 --- a/packages/ai/src/api/google-generative-ai.ts
 +++ b/packages/ai/src/api/google-generative-ai.ts
-@@ -9,7 +9,6 @@ import type {
- 	Api,
+@@ -11,7 +11,6 @@ import type {
  	AssistantMessage,
+ 	FetchFunction,
  	Model,
 -	ProviderHeaders,
  	SimpleStreamOptions,
  	StreamFunction,
  	StreamOptions,
-@@ -87,11 +86,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
- 			if (options?.fetch && options.fetch !== globalThis.fetch) {
- 				throw new Error("Custom fetch is not supported by the Google Generative AI adapter");
- 			}
+@@ -86,11 +85,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
+ 		};
+ 
+ 		try {
 -			const apiKey = options?.apiKey;
 -			if (!apiKey) {
 -				throw new Error(`No API key for provider: ${model.provider}`);
 -			}
--			const client = createClient(model, apiKey, options?.headers, options?.identity);
-+			const client = createClient(model, resolveRequestAuth(model, options), options?.identity);
+-			const client = createClient(model, apiKey, options?.headers, options?.identity, options?.fetch);
++			const client = createClient(model, resolveRequestAuth(model, options, options?.identity), options?.fetch);
  			let params = buildParams(model, normalizedContext, options);
  			const nextParams = await options?.onPayload?.(params, model);
  			if (nextParams !== undefined) {
-@@ -301,13 +296,11 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
+@@ -300,13 +295,11 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
  	context: TranscriptContext,
  	options?: SimpleStreamOptions,
  ): AssistantMessageEventStream => {
@@ -40,10 +40,11 @@ index 213eff5e8..fd80325f5 100644
  		toolChoice: options?.toolChoice,
  	} satisfies GoogleOptions;
  	if (!options?.reasoning) {
-@@ -339,10 +332,53 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
+@@ -338,11 +331,53 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
  	} satisfies GoogleOptions);
  };
  
+-function createClient(
 +type GoogleRequestAuth =
 +	| { kind: "api_key"; apiKey: string; headers?: Record<string, string> }
 +	| { kind: "bearer"; headers: Record<string, string> };
@@ -63,9 +64,11 @@ index 213eff5e8..fd80325f5 100644
 + * bearer path, which never hands the token to the SDK as an API key.
 + */
 +function resolveRequestAuth(
-+	model: Model<"google-generative-ai">,
+ 	model: Model<"google-generative-ai">,
+-	apiKey?: string,
+-	optionsHeaders?: ProviderHeaders,
 +	options?: Pick<GoogleOptions, "apiKey" | "headers">,
-+	identity?: ClientIdentity,
+ 	identity?: ClientIdentity,
 +): GoogleRequestAuth {
 +	const headers = providerHeadersToRecord(getIdentityHeaders(model, identity), model.headers, options?.headers);
 +	if (headers && hasHeader(headers, "authorization")) return { kind: "bearer", headers };
@@ -88,25 +91,24 @@ index 213eff5e8..fd80325f5 100644
 + */
 +const BEARER_API_KEY_PLACEHOLDER = "bearer";
 +
- function createClient(
- 	model: Model<"google-generative-ai">,
--	apiKey?: string,
--	optionsHeaders?: ProviderHeaders,
++function createClient(
++	model: Model<"google-generative-ai">,
 +	auth: GoogleRequestAuth,
- 	identity?: ClientIdentity,
+ 	fetch?: FetchFunction,
  ): GoogleGenAI {
- 	const httpOptions: { baseUrl?: string; apiVersion?: string; headers?: Record<string, string> } = {};
-@@ -350,11 +386,21 @@ function createClient(
+ 	// Always pass fetch: without one, @google/genai adds a per-request dispatcher that disables
+@@ -352,9 +387,18 @@ function createClient(
  		httpOptions.baseUrl = model.baseUrl;
  		httpOptions.apiVersion = ""; // baseUrl already includes version path, don't append
  	}
 -	const headers = providerHeadersToRecord(getIdentityHeaders(model, identity), model.headers, optionsHeaders);
-+	const headers = providerHeadersToRecord(getIdentityHeaders(model, identity), model.headers, auth.headers);
- 	if (headers) {
- 		httpOptions.headers = headers;
- 	}
- 
-+	let apiKey: string | undefined;
+-	if (headers) {
+-		httpOptions.headers = headers;
++	if (auth.headers) {
++		httpOptions.headers = auth.headers;
++	}
++
++	let apiKey: string;
 +	if (auth.kind === "bearer") {
 +		apiKey = BEARER_API_KEY_PLACEHOLDER;
 +		if (!hasHeader(httpOptions.headers ?? {}, "x-goog-api-key")) {
@@ -114,11 +116,9 @@ index 213eff5e8..fd80325f5 100644
 +		}
 +	} else {
 +		apiKey = auth.apiKey;
-+	}
-+
- 	return new GoogleGenAI({
- 		apiKey,
- 		httpOptions: Object.keys(httpOptions).length > 0 ? httpOptions : undefined,
+ 	}
+ 
+ 	return new GoogleGenAI({ apiKey, httpOptions });
 diff --git a/packages/ai/src/auth/oauth/google.ts b/packages/ai/src/auth/oauth/google.ts
 new file mode 100644
 index 000000000..2fc292df3

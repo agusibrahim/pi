@@ -16,7 +16,7 @@ on:
         type: boolean
         default: true
       windows:
-        description: 'Build Windows binaries (windows-x64, windows-arm64)'
+        description: 'Build Windows binary (windows-x64 / amd64)'
         type: boolean
         default: false
       sync:

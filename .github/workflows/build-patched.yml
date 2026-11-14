@@ -27,7 +27,7 @@ on:
         type: boolean
         default: true
       windows:
-        description: 'Build Windows binaries (windows-x64, windows-arm64)'
+        description: 'Build Windows binary (windows-x64 / amd64)'
         type: boolean
         default: false
       sync:
@@ -76,7 +76,6 @@ jobs:
             }
             if (wantWindows) {
               items.push({ label: "windows-x64", family: "windows", runner: "ubuntu-latest", platform: "windows-x64" });
-              items.push({ label: "windows-arm64", family: "windows", runner: "ubuntu-latest", platform: "windows-arm64" });
             }
 
             if (items.length === 0) {
