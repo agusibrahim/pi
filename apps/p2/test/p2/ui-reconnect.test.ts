@@ -155,7 +155,7 @@ export default defineFacet((host) => host.serve(Delay, (_params, self) => {
 			const originalFetch=window.fetch.bind(window);window.fetch=async(url,options)=>{const response=await originalFetch(url,options);if(String(url)==='/__p2_dev' && options?.method!=='POST')window.devNoticeReads++;return response;};
 			window.WebSocket=new Proxy(window.WebSocket,{construct(Target,args){
 				const socket=Reflect.construct(Target,args);
-				if(String(args[0]).endsWith('/chord'))socket.addEventListener('open',()=>window.reconnectOpens++);
+				if(new URL(String(args[0])).pathname==='/chord')socket.addEventListener('open',()=>window.reconnectOpens++);
 				return socket;
 			}});
 		`,
@@ -239,6 +239,11 @@ export default defineFacet((host) => host.serve(Delay, (_params, self) => {
 		await stop();
 		await browser.wait(`document.querySelector('.offline')`);
 		await delay(30_000);
+		// The sidebar keeps the rows as last seen while the server is down.
+		assert.match(
+			await browser.evaluate<string>("document.querySelector('.session-scroll')?.textContent ?? ''"),
+			/Reconnect fixture/,
+		);
 		await start();
 		await recovered("unsent outage draft");
 		assert.equal(await browser.evaluate<number>("window.reconnectOpens"), 2);

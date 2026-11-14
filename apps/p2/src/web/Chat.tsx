@@ -3,7 +3,6 @@ import {
 	type CSSProperties,
 	createContext,
 	memo,
-	type PointerEvent,
 	type ReactNode,
 	useContext,
 	useEffect,
@@ -19,9 +18,10 @@ import {
 	DEFAULT_DETAIL,
 	type Detail,
 	type ToolActivityTable,
-	thoughtPreview,
+	wheelThought,
 } from "./activity/model.ts";
 import { Results } from "./activity/Results.tsx";
+import { handoff, type SlotHeights, SlotHeightsContext } from "./activity/ThoughtSlot.tsx";
 import { CopyButton } from "./Code.tsx";
 import { BranchFrom, OpenConversation, OpenPeerConversation, ReplyTo, RevealEntry } from "./chat-context.ts";
 import {
@@ -36,6 +36,7 @@ import {
 	UsersIcon,
 } from "./icons.tsx";
 import { imageSize } from "./image-size.ts";
+import { useLongPress } from "./long-press.ts";
 import { Markdown } from "./Markdown.tsx";
 import { RowEstimator, type RowFeatures } from "./row-estimate.ts";
 import { Time } from "./Time.tsx";
@@ -174,34 +175,23 @@ export function jumpToEntry(entryId: number): boolean {
 }
 
 /**
- * How to start a reply to one message: a button that shows on hover (hidden for coarse pointers), and a long press
- * (half a second, without moving) on touch screens. Nothing when replies are off or the item has no entry yet.
+ * How to start a reply to one message: a button that shows on hover (hidden for coarse pointers), and a long press on
+ * touch screens. Nothing when replies are off or the item has no entry yet.
  */
 function useReply(entryId: number | undefined, name: string) {
 	const reply = useContext(ReplyTo);
-	const press = useRef<ReturnType<typeof setTimeout>>(undefined);
+	const press = useLongPress(() => {
+		if (reply && entryId !== undefined) reply({ entryId, name });
+	});
 	if (!reply || entryId === undefined) return { button: null, gesture: {} };
 	const start = () => reply({ entryId, name });
-	const cancel = () => clearTimeout(press.current);
 	return {
 		button: (
 			<button type="button" className="reply-button" aria-label={`Reply to ${name}`} onClick={start}>
 				<ReplyIcon />
 			</button>
 		),
-		gesture: {
-			onPointerDown: (event: PointerEvent) => {
-				if (event.pointerType !== "touch") return;
-				cancel();
-				press.current = setTimeout(() => {
-					navigator.vibrate?.(10);
-					start();
-				}, 500);
-			},
-			onPointerUp: cancel,
-			onPointerCancel: cancel,
-			onPointerMove: cancel,
-		},
+		gesture: press.handlers,
 	};
 }
 
@@ -280,13 +270,13 @@ function rowFeatures(row: TranscriptRow, width: number): RowFeatures {
 				fixed: imagesHeight(item.images, width),
 			};
 		case "activity": {
-			const preview = thoughtPreview(item.entries ?? [], item.working, item.thought);
+			const thought = wheelThought(item.entries ?? [], item.working);
 			// A working wheel may also carry up to three lines of its latest thought.
 			return item.rows
 				? { kind: `activity:rows:${item.steps.length}:${spacing}`, text: 0, fixed: 0 }
 				: {
-						kind: `activity:${preview ? "thought:" : ""}${spacing}`,
-						text: Math.min(preview?.length ?? 0, 300),
+						kind: `activity:${thought ? "thought:" : ""}${spacing}`,
+						text: Math.min(thought?.text.length ?? 0, 300),
 						fixed: 0,
 					};
 		}
@@ -401,7 +391,7 @@ function Incoming({ item }: { item: Extract<Item, { type: "user" }> }) {
 						className="edit-button"
 						aria-label="Edit"
 						title="Edit: continue the session before this message, with its text in the composer"
-						onClick={() => branch(entryId)}
+						onClick={() => branch.from(entryId)}
 					>
 						<PencilIcon />
 					</button>
@@ -518,7 +508,7 @@ function UserMessage({ item }: { item: Extract<Item, { type: "user" }> }) {
 							className="copy"
 							aria-label="Edit"
 							title="Edit: continue the session before this message, with its text in the composer"
-							onClick={() => branch(entryId)}
+							onClick={() => branch.from(entryId)}
 						>
 							<PencilIcon />
 						</button>
@@ -566,13 +556,13 @@ const Answer = memo(function Answer({ item }: { item: Extract<ChatItem, { type: 
 					{!item.streaming && (
 						<div className="message-actions">
 							<CopyButton text={text} />
-							{branch && entryId !== undefined && (
+							{branch && entryId !== undefined && entryId !== branch.end && (
 								<button
 									type="button"
 									className="copy"
 									aria-label="Branch from here"
 									title="Branch from here: continue the session after this answer"
-									onClick={() => branch(entryId)}
+									onClick={() => branch.from(entryId)}
 								>
 									<BranchIcon />
 								</button>
@@ -616,7 +606,6 @@ const ItemView = memo(function ItemView({ item }: { item: ChatItem }) {
 					{...(item.entries ? { entries: item.entries } : {})}
 					{...(item.rows ? { rows: true } : {})}
 					working={item.working}
-					{...(item.thought ? { thought: item.thought } : {})}
 					{...(item.startedAt ? { startedAt: item.startedAt } : {})}
 					{...(item.endedAt ? { endedAt: item.endedAt } : {})}
 				/>
@@ -770,6 +759,7 @@ export const Messages = memo(function Messages({
 }) {
 	const spacers = list.spacers(range);
 	const arriving = useArriving(rows);
+	const [slotHeights] = useState<SlotHeights>(() => new Map());
 	return (
 		<div className="messages">
 			{/* One height in every state: the edge changing never moves the transcript under the reader. It loads ahead
@@ -792,24 +782,37 @@ export const Messages = memo(function Messages({
 			)}
 			<div className="rows" ref={list.listRef} data-rows={rows.length}>
 				<div className="row-space" ref={list.topRef} style={{ height: spacers.before }} />
-				{rows.slice(range.start, range.end + 1).map((row) => {
-					const delay = arriving.get(row.key);
-					return (
-						<div
-							key={row.key}
-							className={["row", row.first ? "first" : "", delay === undefined ? "" : "arriving"]
-								.filter(Boolean)
-								.join(" ")}
-							style={delay ? { animationDelay: `${delay}ms` } : undefined}
-							data-row={row.key}
-							data-gap={row.first ? undefined : row.gap}
-							data-lead={row.lead ? "" : undefined}
-							ref={list.rowRef}
-						>
-							<ItemView item={row.item} />
-						</div>
-					);
-				})}
+				<SlotHeightsContext value={slotHeights}>
+					{rows.slice(range.start, range.end + 1).map((row, offset) => {
+						const index = range.start + offset;
+						const delay = arriving.get(row.key);
+						// The row after a finished wheel takes the place of its thought (activity/ThoughtSlot.tsx).
+						const held = handoff(slotHeights, rows[index - 1], index === rows.length - 1, transcript.working);
+						return (
+							<div
+								key={row.key}
+								className={["row", row.first ? "first" : "", delay === undefined ? "" : "arriving"]
+									.filter(Boolean)
+									.join(" ")}
+								style={
+									delay || held !== undefined
+										? {
+												...(delay ? { animationDelay: `${delay}ms` } : {}),
+												...(held === undefined ? {} : { minHeight: held }),
+											}
+										: undefined
+								}
+								data-row={row.key}
+								data-gap={row.first ? undefined : row.gap}
+								data-lead={row.lead ? "" : undefined}
+								data-handoff={held === undefined ? undefined : held ? "held" : "released"}
+								ref={list.rowRef}
+							>
+								<ItemView item={row.item} />
+							</div>
+						);
+					})}
+				</SlotHeightsContext>
 				<div className="row-space" ref={list.bottomRef} style={{ height: spacers.after }} />
 			</div>
 			{stopped && !transcript.busy && <output className="notice stopped">Stopped</output>}
